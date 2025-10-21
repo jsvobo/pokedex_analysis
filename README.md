@@ -1,8 +1,3 @@
-
-<center>
-  <img src="https://www.dylanlf.com/quiz/banner2.png" />
-</center>
-
 # The Complete Pokédex Dataset
 Simple web scraping example for collecting Pokémon stats from a Pokédex site. This dataset is available at Kaggle under [The Complete Pokédex Dataset](https://www.kaggle.com/cristobalmitchell/pokedex) 
 
@@ -44,3 +39,37 @@ The output dataset file pokemon.csv contains all 898 pokémon from Gen I - Gen V
 * **mega_evolution:** Form of Pokémon if mega evolution capable
 * **mega_evolution_alt:** Alternative form of Pokémon if mega evolution capable
 * **description:** Pokédex description from official Pokémon website
+
+## Filtered data types
+* **national_number:** Index number
+* **gen:** The numbered generation which the Pokémon was first introduced
+* **primary_type:** The Primary Type of the Pokémon (18 types)
+* **secondary_type:** The Secondary Type of the Pokémon (19 types)
+* **percent_male:** The percentage of the species that are male (0 if the Pokémon is genderless)
+* **percent_female:** The percentage of the species that are female (0 if the Pokémon is genderless)
+* **height_m:** Height of the Pokémon in metres
+* **weight_kg:** The Weight of the Pokémon in kilograms
+* **capture_rate:** Capture Rate of the Pokémon __(not %! absolute value of some inner point system)__
+* **baseeggsteps:** The number of steps required to hatch an egg of the Pokémon
+* **hp:** The Base HP of the Pokémon
+* **attack:** The Base Attack of the Pokémon
+* **defense:** The Base Defense of the Pokémon
+* **sp_attack:** The Base Special Attack of the Pokémon
+* **sp_defense:** The Base Special Defense of the Pokémon
+* **speed:** The Base Speed of the Pokémon
+* **against_*:** Eighteen features that denote the amount of damage taken against an attack of a particular type
+* **evo_length:** Length of evolution chain (with level triggers) 0-6
+* **has_mega_evolution:** 1 if has **mega_evolution** or **mega_evolution_alt** in the original dataset, else 0
+* **has_gigantamax:** 1 if has **gigantamax** in the original dataset, else 0
+* **rarity:** Column 0-3 either normal, sublegendary, legendary or mythical in the original dataset.
+
+#### Dropped columns:
+**english_name**
+**japanese_name**
+**classification** (was 640 classes)
+**abilities_*:**
+**is_*:** (legendary etc.)
+**evochain_*:**
+**gigantamax**
+**mega_evolution:** (both possible, normal+ alt)
+
