@@ -64,12 +64,12 @@ The output dataset file pokemon.csv contains all 898 pokémon from Gen I - Gen V
 * **rarity:** Column 0-3 either normal, sublegendary, legendary or mythical in the original dataset.
 
 #### Dropped columns:
-**english_name**
-**japanese_name**
-**classification** (was 640 classes)
-**abilities_*:**
-**is_*:** (legendary etc.)
-**evochain_*:**
-**gigantamax**
-**mega_evolution:** (both possible, normal+ alt)
+  **english_name**
+  **japanese_name**
+  **classification** (was 640 classes)
+  **abilities_*:**
+  **is_*:** (legendary etc.)
+  **evochain_*:**
+  **gigantamax**
+  **mega_evolution:** (both possible, normal+ alt)
 
