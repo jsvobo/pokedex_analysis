@@ -1,0 +1,1603 @@
+---
+title: "Pokémon Power Creep GLM Analysis"
+subtitle: "Prerequisites Examination and Generalized Linear Model Analysis"
+author: "Jan Tychtl"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    fig_width: 10
+    fig_height: 6
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center"
+)
+```
+
+# Introduction
+
+## Research Question
+
+**Is there Power Creep in the Pokémon Index?**
+
+Power creep is defined as any statistically provable rising trend in Pokémon statistics across generations. Our goal is to detect whether later generations have systematically higher combat statistics than earlier ones.
+
+## Approach
+
+Before applying Generalized Linear Models, we must understand our data to choose appropriate model specifications. This document:
+
+1. **Prerequisites Analysis**: Examines data characteristics to justify GLM choices
+2. **GLM Implementation**: Fits appropriate models and tests for power creep
+3. **Robustness Checks**: Verifies findings across multiple specifications
+
+---
+
+# 1. Setup and Data Loading
+
+```{r libraries, message=FALSE}
+# Core packages
+library(tidyverse)
+library(ggplot2)
+library(gridExtra)
+
+# Statistical modeling
+library(car)          # VIF, ANOVA
+library(MASS)         # Robust regression
+library(lmtest)       # Breusch-Pagan test
+library(broom)        # Tidy model outputs
+
+# Specialized tests
+library(moments)      # Skewness and kurtosis
+library(DescTools)    # Jonckheere-Terpstra test
+
+# Visualization
+library(corrplot)     # Correlation plots
+library(scales)       # Scale functions for plots
+```
+
+```{r load-data}
+# Set working directory and load data
+setwd("/home/jenda/Desktop/SAN/pokedex_analysis")
+pokemon <- read.csv("data/data_clean.csv")
+pokemon_clean <- read.csv("data/data_no_outliers.csv")
+
+cat(paste0("Full dataset: ", nrow(pokemon), " Pokémon\n",
+           "Outlier-free dataset: ", nrow(pokemon_clean), " Pokémon\n",
+           "Removed as outliers: ", nrow(pokemon) - nrow(pokemon_clean), " Pokémon\n"))
+```
+
+```{r preprocess-data}
+# Convert factors for FULL DATA
+pokemon <- pokemon %>%
+  mutate(
+    gen = as.factor(gen),
+    rarity = as.factor(rarity),
+    class_primary = as.factor(class_primary),
+    class_secondary = as.factor(class_secondary),
+    has_mega_evolution = as.factor(has_mega_evolution),
+    has_gigantamax = as.factor(has_gigantamax)
+  )
+
+# Define rarity levels (0 = normal, 1 = sublegendary, 2 = legendary, 3 = mythical)
+levels(pokemon$rarity) <- c("Normal", "SubLegendary", "Legendary", "Mythical")
+
+# Convert factors for OUTLIER-FREE DATA
+pokemon_clean <- pokemon_clean %>%
+  mutate(
+    gen = as.factor(gen),
+    rarity = as.factor(rarity),
+    class_primary = as.factor(class_primary),
+    class_secondary = as.factor(class_secondary),
+    has_mega_evolution = as.factor(has_mega_evolution),
+    has_gigantamax = as.factor(has_gigantamax)
+  )
+levels(pokemon_clean$rarity) <- c("Normal", "SubLegendary", "Legendary", "Mythical")
+
+# Create derived features
+pokemon <- pokemon %>%
+  mutate(
+    total_stats = hp + attack + defense + sp_attack + sp_defense + speed,
+    physical_power = attack + defense,
+    special_power = sp_attack + sp_defense,
+    offensive_power = attack + sp_attack,
+    defensive_power = defense + sp_defense,
+    gen_numeric = as.numeric(as.character(gen))
+  )
+
+pokemon_clean <- pokemon_clean %>%
+  mutate(
+    total_stats = hp + attack + defense + sp_attack + sp_defense + speed,
+    physical_power = attack + defense,
+    special_power = sp_attack + sp_defense,
+    offensive_power = attack + sp_attack,
+    defensive_power = defense + sp_defense,
+    gen_numeric = as.numeric(as.character(gen))
+  )
+
+# Create NORMAL-ONLY dataset (excluding legendaries/mythicals)
+pokemon_normal <- pokemon %>% 
+  filter(rarity == "Normal") %>%
+  mutate(
+    total_stats = hp + attack + defense + sp_attack + sp_defense + speed,
+    physical_power = attack + defense,
+    special_power = sp_attack + sp_defense,
+    offensive_power = attack + sp_attack,
+    defensive_power = defense + sp_defense,
+    gen_numeric = as.numeric(as.character(gen))
+  )
+
+cat(paste0("\n--- Dataset Summary ---\n",
+           "Full dataset: ", nrow(pokemon), " Pokémon\n",
+           "Outlier-free: ", nrow(pokemon_clean), " Pokémon\n",
+           "Normal-only: ", nrow(pokemon_normal), " Pokémon (", 
+           round(100 * nrow(pokemon_normal) / nrow(pokemon), 1), "% of full)\n"))
+```
+
+---
+
+# 2. Prerequisites Analysis
+
+Before using GLMs, we must determine:
+
+1. What **type** of variables are we modeling?
+2. What **distribution** does the response follow?
+3. How does **variance** relate to the **mean**?
+4. What **link function** is appropriate?
+5. Are model **assumptions** satisfied?
+
+## 2.1 Variables That Could Show Power Creep
+
+Power creep could manifest in any combat-relevant statistic:
+
+```{r power-creep-variables}
+# Define combat stats to analyze
+individual_stats <- c("hp", "attack", "defense", "sp_attack", "sp_defense", "speed")
+
+# Summary of individual stats
+stats_summary <- pokemon %>%
+  summarise(across(all_of(individual_stats), 
+                   list(Mean = ~mean(., na.rm = TRUE),
+                        Median = ~median(., na.rm = TRUE),
+                        SD = ~sd(., na.rm = TRUE),
+                        Min = ~min(., na.rm = TRUE),
+                        Max = ~max(., na.rm = TRUE))))
+
+# Reshape for display
+stats_long <- data.frame(
+  Variable = c("HP", "Attack", "Defense", "Sp.Attack", "Sp.Defense", "Speed"),
+  Mean = c(mean(pokemon$hp), mean(pokemon$attack), mean(pokemon$defense),
+           mean(pokemon$sp_attack), mean(pokemon$sp_defense), mean(pokemon$speed)),
+  Median = c(median(pokemon$hp), median(pokemon$attack), median(pokemon$defense),
+             median(pokemon$sp_attack), median(pokemon$sp_defense), median(pokemon$speed)),
+  SD = c(sd(pokemon$hp), sd(pokemon$attack), sd(pokemon$defense),
+         sd(pokemon$sp_attack), sd(pokemon$sp_defense), sd(pokemon$speed)),
+  Min = c(min(pokemon$hp), min(pokemon$attack), min(pokemon$defense),
+          min(pokemon$sp_attack), min(pokemon$sp_defense), min(pokemon$speed)),
+  Max = c(max(pokemon$hp), max(pokemon$attack), max(pokemon$defense),
+          max(pokemon$sp_attack), max(pokemon$sp_defense), max(pokemon$speed))
+)
+
+cat("═══════════════════════════════════════════════════════════════════
+              INDIVIDUAL COMBAT STATS SUMMARY
+═══════════════════════════════════════════════════════════════════\n\n")
+# Round only numeric columns
+stats_long[, -1] <- round(stats_long[, -1], 1)
+print(stats_long, row.names = FALSE)
+
+# Composite measures
+cat("\n═══════════════════════════════════════════════════════════════════
+              COMPOSITE MEASURES SUMMARY
+═══════════════════════════════════════════════════════════════════\n\n")
+
+composite_summary <- data.frame(
+  Measure = c("Total Stats", "Offensive", "Defensive", "Physical", "Special"),
+  Formula = c("HP+Atk+Def+SpA+SpD+Spd", "Atk+SpA", "Def+SpD", "Atk+Def", "SpA+SpD"),
+  Mean = c(mean(pokemon$total_stats), mean(pokemon$offensive_power), 
+           mean(pokemon$defensive_power), mean(pokemon$physical_power),
+           mean(pokemon$special_power)),
+  SD = c(sd(pokemon$total_stats), sd(pokemon$offensive_power),
+         sd(pokemon$defensive_power), sd(pokemon$physical_power),
+         sd(pokemon$special_power))
+)
+# Round only numeric columns
+composite_summary[, c("Mean", "SD")] <- round(composite_summary[, c("Mean", "SD")], 1)
+print(composite_summary, row.names = FALSE)
+```
+
+```{r visualize-stats-overview, fig.width=12, fig.height=8}
+# Visualize all combat stats distributions
+stats_plot_data <- pokemon %>%
+  dplyr::select(all_of(individual_stats)) %>%
+  pivot_longer(everything(), names_to = "stat", values_to = "value") %>%
+  mutate(stat = factor(stat, levels = individual_stats,
+                       labels = c("HP", "Attack", "Defense", "Sp.Attack", "Sp.Defense", "Speed")))
+
+ggplot(stats_plot_data, aes(x = value, fill = stat)) +
+  geom_histogram(bins = 30, alpha = 0.8, color = "white") +
+  facet_wrap(~stat, scales = "free", ncol = 3) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Distribution of Combat Stats",
+       subtitle = "All six individual combat statistics",
+       x = "Stat Value", y = "Count") +
+  theme_minimal() +
+  theme(legend.position = "none",
+        strip.text = element_text(size = 12, face = "bold"))
+```
+
+## 2.2 The Predictor: Generation as Categorical Factor
+
+Generation is our key predictor. We treat it as a **categorical factor** rather than numeric:
+
+- **No linear assumption**: Allows detection of non-monotonic patterns
+- **Interpretable coefficients**: Each coefficient = difference from Gen 1
+- **Flexibility**: Can capture dips, spikes, or any pattern
+
+```{r generation-distribution, fig.width=10, fig.height=5}
+# Generation distribution
+gen_counts <- pokemon %>%
+  group_by(gen) %>%
+  summarise(n = n()) %>%
+  mutate(prop = n / sum(n) * 100)
+
+p_gen_bar <- ggplot(gen_counts, aes(x = gen, y = n, fill = gen)) +
+  geom_bar(stat = "identity", alpha = 0.8) +
+  geom_text(aes(label = n), vjust = -0.5, size = 4) +
+  scale_fill_viridis_d(option = "plasma") +
+  labs(title = "Pokémon Count by Generation",
+       subtitle = "Generation serves as categorical predictor (reference = Gen 1)",
+       x = "Generation", y = "Number of Pokémon") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Mean attack by generation (preview of pattern)
+gen_attack <- pokemon %>%
+  group_by(gen) %>%
+  summarise(mean_attack = mean(attack, na.rm = TRUE),
+            se = sd(attack, na.rm = TRUE) / sqrt(n()))
+
+p_gen_attack <- ggplot(gen_attack, aes(x = gen, y = mean_attack, fill = gen)) +
+  geom_bar(stat = "identity", alpha = 0.8) +
+  geom_errorbar(aes(ymin = mean_attack - 1.96*se, ymax = mean_attack + 1.96*se), 
+                width = 0.3) +
+  geom_hline(yintercept = gen_attack$mean_attack[1], linetype = "dashed", 
+             color = "red", linewidth = 1) +
+  scale_fill_viridis_d(option = "plasma") +
+  labs(title = "Mean Attack by Generation",
+       subtitle = "Red dashed line = Gen 1 baseline; Error bars = 95% CI",
+       x = "Generation", y = "Mean Attack") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+grid.arrange(p_gen_bar, p_gen_attack, ncol = 2)
+
+cat("\n--- Generation Sample Sizes ---\n")
+print(gen_counts)
+```
+
+**Observation:** The pattern is NOT monotonic — Gen 2 and Gen 6 dip below Gen 1. This justifies categorical encoding over numeric (which would force a linear assumption).
+
+## 2.3 Distribution of Response Variables
+
+For Gaussian GLMs to be appropriate, data should be approximately normally distributed without severe skewness.
+
+```{r distribution-analysis}
+# Calculate skewness and kurtosis for all combat stats
+dist_stats <- data.frame(
+  Variable = c("Attack", "HP", "Defense", "Sp.Attack", "Sp.Defense", "Speed", "Total Stats"),
+  Mean = c(mean(pokemon$attack), mean(pokemon$hp), mean(pokemon$defense),
+           mean(pokemon$sp_attack), mean(pokemon$sp_defense), mean(pokemon$speed),
+           mean(pokemon$total_stats)),
+  Median = c(median(pokemon$attack), median(pokemon$hp), median(pokemon$defense),
+             median(pokemon$sp_attack), median(pokemon$sp_defense), median(pokemon$speed),
+             median(pokemon$total_stats)),
+  SD = c(sd(pokemon$attack), sd(pokemon$hp), sd(pokemon$defense),
+         sd(pokemon$sp_attack), sd(pokemon$sp_defense), sd(pokemon$speed),
+         sd(pokemon$total_stats)),
+  Skewness = c(skewness(pokemon$attack), skewness(pokemon$hp), skewness(pokemon$defense),
+               skewness(pokemon$sp_attack), skewness(pokemon$sp_defense), 
+               skewness(pokemon$speed), skewness(pokemon$total_stats)),
+  Kurtosis = c(kurtosis(pokemon$attack), kurtosis(pokemon$hp), kurtosis(pokemon$defense),
+               kurtosis(pokemon$sp_attack), kurtosis(pokemon$sp_defense),
+               kurtosis(pokemon$speed), kurtosis(pokemon$total_stats)),
+  Min = c(min(pokemon$attack), min(pokemon$hp), min(pokemon$defense),
+          min(pokemon$sp_attack), min(pokemon$sp_defense), min(pokemon$speed),
+          min(pokemon$total_stats)),
+  Max = c(max(pokemon$attack), max(pokemon$hp), max(pokemon$defense),
+          max(pokemon$sp_attack), max(pokemon$sp_defense), max(pokemon$speed),
+          max(pokemon$total_stats))
+)
+
+cat("═══════════════════════════════════════════════════════════════════
+              DISTRIBUTION STATISTICS
+═══════════════════════════════════════════════════════════════════
+Skewness: 0 = symmetric, >0 = right tail, <0 = left tail
+Values |skewness| < 1 are considered approximately normal
+═══════════════════════════════════════════════════════════════════\n\n")
+
+dist_stats[, -1] <- round(dist_stats[, -1], 2)
+print(dist_stats, row.names = FALSE)
+```
+
+### Shapiro-Wilk Normality Test
+
+The Shapiro-Wilk test formally tests the null hypothesis that data comes from a normal distribution. However, with large samples (n > 50), it becomes very sensitive and will reject normality for even trivial deviations that have no practical impact on GLM inference.
+
+```{r shapiro-wilk-test}
+# Shapiro-Wilk test for each combat stat
+# Note: For large n, we use a random sample of 5000 (Shapiro-Wilk limit)
+# Our dataset has ~1024 observations, so we can test directly
+
+shapiro_results <- data.frame(
+  Variable = c("Attack", "HP", "Defense", "Sp.Attack", "Sp.Defense", "Speed", "Total Stats"),
+  W_statistic = c(
+    shapiro.test(pokemon$attack)$statistic,
+    shapiro.test(pokemon$hp)$statistic,
+    shapiro.test(pokemon$defense)$statistic,
+    shapiro.test(pokemon$sp_attack)$statistic,
+    shapiro.test(pokemon$sp_defense)$statistic,
+    shapiro.test(pokemon$speed)$statistic,
+    shapiro.test(pokemon$total_stats)$statistic
+  ),
+  p_value = c(
+    shapiro.test(pokemon$attack)$p.value,
+    shapiro.test(pokemon$hp)$p.value,
+    shapiro.test(pokemon$defense)$p.value,
+    shapiro.test(pokemon$sp_attack)$p.value,
+    shapiro.test(pokemon$sp_defense)$p.value,
+    shapiro.test(pokemon$speed)$p.value,
+    shapiro.test(pokemon$total_stats)$p.value
+  )
+) %>%
+  mutate(
+    Normal = ifelse(p_value > 0.05, "Yes", "No"),
+    Interpretation = case_when(
+      p_value > 0.05 ~ "Cannot reject normality",
+      p_value > 0.01 ~ "Mild departure from normality",
+      p_value > 0.001 ~ "Moderate departure from normality",
+      TRUE ~ "Strong departure from normality"
+    )
+  )
+
+cat("═══════════════════════════════════════════════════════════════════
+              SHAPIRO-WILK NORMALITY TEST
+═══════════════════════════════════════════════════════════════════
+H0: Data is normally distributed
+p > 0.05 → Cannot reject normality
+Note: With n = 1024, test is sensitive to minor deviations
+═══════════════════════════════════════════════════════════════════\n\n")
+
+shapiro_results$W_statistic <- round(shapiro_results$W_statistic, 4)
+shapiro_results$p_value <- format.pval(shapiro_results$p_value, digits = 3)
+print(shapiro_results, row.names = FALSE)
+```
+
+**Interpretation:** As expected with n = 1024, the Shapiro-Wilk test rejects normality for ALL variables (all p < 0.001). This does **not** invalidate our GLM approach for several reasons:
+
+1. **GLMs are robust to non-normality**: The Gaussian GLM assumes normality of residuals, not the raw data. With proper controls, residuals are often better-behaved than raw values.
+
+2. **Central Limit Theorem**: With n > 1000, coefficient estimates and their standard errors are asymptotically normal regardless of the underlying distribution.
+
+3. **Practical vs statistical significance**: The W statistics (0.92 - 0.99) indicate the distributions are "close to normal" in shape — the test rejects because it can detect tiny deviations, not because the data is wildly non-normal.
+
+4. **Q-Q plots tell the real story**: Visual inspection shows the departures are mainly in the tails (extreme values), not the bulk of the distribution where most inference occurs.
+
+For Attack specifically (W = 0.987), the distribution is very close to normal. HP (W = 0.918) shows the largest departure due to extreme outliers like Blissey.
+
+```{r histogram-density, fig.width=14, fig.height=8}
+# Histograms with density overlay and normal curve comparison
+plot_stat_dist <- function(data, var_name, title, color) {
+  var_data <- data[[var_name]]
+  mean_val <- mean(var_data, na.rm = TRUE)
+  sd_val <- sd(var_data, na.rm = TRUE)
+  
+  ggplot(data, aes_string(x = var_name)) +
+    geom_histogram(aes(y = after_stat(density)), bins = 30, 
+                   fill = color, alpha = 0.7, color = "white") +
+    geom_density(linewidth = 1.2, color = "black") +
+    stat_function(fun = dnorm, args = list(mean = mean_val, sd = sd_val),
+                  linewidth = 1.2, color = "red", linetype = "dashed") +
+    geom_vline(xintercept = mean_val, color = "blue", linewidth = 1, linetype = "solid") +
+    geom_vline(xintercept = median(var_data), color = "darkgreen", 
+               linewidth = 1, linetype = "dotted") +
+    labs(title = title,
+         subtitle = paste0("Mean = ", round(mean_val, 1), 
+                          ", Median = ", round(median(var_data), 1),
+                          ", Skew = ", round(skewness(var_data), 2)),
+         x = title, y = "Density") +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold"))
+}
+
+# Create distribution plots
+p1 <- plot_stat_dist(pokemon, "attack", "Attack", "#E76F51")
+p2 <- plot_stat_dist(pokemon, "hp", "HP", "#2A9D8F")
+p3 <- plot_stat_dist(pokemon, "defense", "Defense", "#E9C46A")
+p4 <- plot_stat_dist(pokemon, "sp_attack", "Sp.Attack", "#F4A261")
+p5 <- plot_stat_dist(pokemon, "sp_defense", "Sp.Defense", "#264653")
+p6 <- plot_stat_dist(pokemon, "speed", "Speed", "#9B5DE5")
+
+grid.arrange(p1, p2, p3, p4, p5, p6, ncol = 3,
+             top = "Response Variable Distributions\n(Black = kernel density, Red dashed = theoretical normal, Blue = mean, Green dotted = median)")
+```
+
+**Findings:**
+
+- Most combat stats show slight to moderate positive skewness: Attack (0.28), Speed (0.39), Sp.Attack (0.58), Sp.Defense (0.82), Defense (0.96). These values indicate right tails from high-stat Pokémon (typically legendaries).
+- **HP is the exception** with skewness of 1.51 — this exceeds the typical threshold of 1.0 for approximate normality. HP has extreme outliers (range 1-255), driven by Pokémon like Blissey.
+- Total Stats shows slight negative skewness (-0.09), indicating a nearly symmetric distribution.
+- **Shapiro-Wilk test rejects normality for all variables** (all p < 0.001), but this is expected with n = 1024. The W statistics (0.92 - 0.99) indicate distributions are reasonably close to normal in shape.
+- Q-Q plots confirm the departures are mainly in the tails (extreme values), not the bulk of the distribution.
+- **Conclusion**: Gaussian GLM remains appropriate for Attack (our primary target, W = 0.987, skewness = 0.28). The Central Limit Theorem ensures valid inference with n > 1000. We use Gamma GLM as a robustness check to handle the positive skewness, particularly for HP (W = 0.918).
+
+## 2.4 Variance-Mean Relationship Analysis
+
+### 2.4.1 Simple Models: Variance by Generation
+
+For simple models (stat ~ generation), we examine residual spread within each generation:
+
+```{r variance-by-generation, fig.width=14, fig.height=10}
+# Calculate residuals and SD by generation for all stats
+variance_analysis <- function(data, stat_var, stat_name) {
+  # Fit simple model
+  formula_str <- paste(stat_var, "~ gen")
+  model_simple <- lm(as.formula(formula_str), data = data)
+  
+  # Get residuals by generation
+  data_with_resid <- data %>%
+    mutate(residuals = residuals(model_simple),
+           fitted = fitted(model_simple))
+  
+  # Variance by generation
+  var_by_gen <- data_with_resid %>%
+    group_by(gen) %>%
+    summarise(
+      n = n(),
+      mean_value = mean(!!sym(stat_var), na.rm = TRUE),
+      sd_residuals = sd(residuals, na.rm = TRUE),
+      var_residuals = var(residuals, na.rm = TRUE)
+    )
+  
+  return(list(data = data_with_resid, var_by_gen = var_by_gen, model = model_simple))
+}
+
+# Analyze all stats
+stats_to_analyze <- c("attack", "hp", "defense", "sp_attack", "sp_defense", "speed")
+stat_names <- c("Attack", "HP", "Defense", "Sp.Attack", "Sp.Defense", "Speed")
+
+var_results <- list()
+for(i in seq_along(stats_to_analyze)) {
+  var_results[[stats_to_analyze[i]]] <- variance_analysis(pokemon, stats_to_analyze[i], stat_names[i])
+}
+
+# Create variance comparison table
+var_comparison <- bind_rows(lapply(names(var_results), function(stat) {
+  var_results[[stat]]$var_by_gen %>%
+    mutate(stat = stat)
+}))
+
+# Display SD by generation for each stat
+var_wide <- var_comparison %>%
+  dplyr::select(gen, stat, sd_residuals) %>%
+  pivot_wider(names_from = stat, values_from = sd_residuals)
+
+cat("═══════════════════════════════════════════════════════════════════
+     RESIDUAL STANDARD DEVIATION BY GENERATION (Simple Models)
+═══════════════════════════════════════════════════════════════════\n\n")
+var_wide[, -1] <- round(var_wide[, -1], 2)
+print(var_wide)
+
+# Range of SDs for each stat
+cat("\n--- SD Range by Stat (across generations) ---\n")
+sd_ranges <- var_comparison %>%
+  group_by(stat) %>%
+  summarise(min_sd = min(sd_residuals),
+            max_sd = max(sd_residuals),
+            ratio = max_sd / min_sd) %>%
+  arrange(desc(ratio))
+sd_ranges[, -1] <- round(sd_ranges[, -1], 2)
+print(sd_ranges)
+```
+
+```{r boxplot-residuals, fig.width=14, fig.height=10}
+# Boxplots of residuals by generation for each stat
+create_resid_boxplot <- function(data_with_resid, stat_name, color) {
+  ggplot(data_with_resid, aes(x = gen, y = residuals, fill = gen)) +
+    geom_boxplot(alpha = 0.7, outlier.color = "red", outlier.size = 2) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 1) +
+    scale_fill_viridis_d(option = "plasma") +
+    labs(title = paste(stat_name, "- Residuals by Generation"),
+         subtitle = "Checking homoscedasticity: boxes should have similar spread",
+         x = "Generation", y = "Residuals") +
+    theme_minimal() +
+    theme(legend.position = "none")
+}
+
+# Create boxplots for all stats
+p_resid_attack <- create_resid_boxplot(var_results$attack$data, "Attack")
+p_resid_hp <- create_resid_boxplot(var_results$hp$data, "HP")
+p_resid_defense <- create_resid_boxplot(var_results$defense$data, "Defense")
+p_resid_sp_attack <- create_resid_boxplot(var_results$sp_attack$data, "Sp.Attack")
+p_resid_sp_defense <- create_resid_boxplot(var_results$sp_defense$data, "Sp.Defense")
+p_resid_speed <- create_resid_boxplot(var_results$speed$data, "Speed")
+
+grid.arrange(p_resid_attack, p_resid_hp, p_resid_defense,
+             p_resid_sp_attack, p_resid_sp_defense, p_resid_speed,
+             ncol = 3, top = "Residual Distributions by Generation (Simple Models)")
+```
+
+### 2.4.2 Breusch-Pagan Test for Heteroscedasticity
+
+```{r breusch-pagan-tests}
+# Breusch-Pagan test for simple and full models
+bp_results <- data.frame(
+  Stat = character(),
+  Simple_p = numeric(),
+  Full_p = numeric(),
+  Simple_Result = character(),
+  Full_Result = character(),
+  stringsAsFactors = FALSE
+)
+
+for(i in seq_along(stats_to_analyze)) {
+  stat_var <- stats_to_analyze[i]
+  stat_name <- stat_names[i]
+  
+  # Simple model
+  formula_simple <- as.formula(paste(stat_var, "~ gen"))
+  model_simple <- lm(formula_simple, data = pokemon)
+  bp_simple <- bptest(model_simple)
+  
+  # Full model with controls (excluding the current stat as predictor)
+  other_stats <- setdiff(c("hp", "attack", "defense", "sp_attack", "sp_defense", "speed"), stat_var)
+  formula_full <- as.formula(paste(stat_var, "~ gen +", paste(other_stats, collapse = " + "), 
+                                   "+ capture_rate + rarity"))
+  model_full <- lm(formula_full, data = pokemon)
+  bp_full <- bptest(model_full)
+  
+  bp_results <- rbind(bp_results, data.frame(
+    Stat = stat_name,
+    Simple_p = bp_simple$p.value,
+    Full_p = bp_full$p.value,
+    Simple_Result = ifelse(bp_simple$p.value > 0.05, "Homoscedastic", "Heteroscedastic"),
+    Full_Result = ifelse(bp_full$p.value > 0.05, "Homoscedastic", "Heteroscedastic")
+  ))
+}
+
+cat("═══════════════════════════════════════════════════════════════════
+              BREUSCH-PAGAN TEST RESULTS
+═══════════════════════════════════════════════════════════════════
+H0: Constant variance (homoscedasticity)
+p < 0.05 → Reject H0 → Heteroscedastic
+═══════════════════════════════════════════════════════════════════\n\n")
+
+bp_results$Simple_p <- round(bp_results$Simple_p, 4)
+bp_results$Full_p <- round(bp_results$Full_p, 4)
+print(bp_results, row.names = FALSE)
+```
+
+### 2.4.3 Diagnostic Plots for Full Model
+
+```{r diagnostic-plots-full, fig.width=12, fig.height=10}
+# Fit full model for Attack
+model_attack_full <- lm(attack ~ gen + hp + defense + sp_attack + sp_defense + 
+                         speed + capture_rate + rarity, data = pokemon)
+
+# Create diagnostic plots
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 2))
+plot(model_attack_full, which = 1:4, 
+     main = "Diagnostic Plots: Attack ~ gen + controls")
+```
+
+```{r scale-location-analysis, fig.width=12, fig.height=6}
+# Custom Scale-Location plot with smoother
+model_data <- data.frame(
+  fitted = fitted(model_attack_full),
+  std_resid = rstandard(model_attack_full),
+  sqrt_std_resid = sqrt(abs(rstandard(model_attack_full)))
+)
+
+p_scale_loc <- ggplot(model_data, aes(x = fitted, y = sqrt_std_resid)) +
+  geom_point(alpha = 0.4, color = "#264653") +
+  geom_smooth(method = "loess", se = TRUE, color = "#E76F51", linewidth = 1.5) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "gray50") +
+  labs(title = "Scale-Location Plot (Full Attack Model)",
+       subtitle = "Flat loess line indicates constant variance; upward slope = heteroscedasticity",
+       x = "Fitted Values", y = "√|Standardized Residuals|") +
+  theme_minimal()
+
+p_resid_fitted <- ggplot(model_data, aes(x = fitted, y = std_resid)) +
+  geom_point(alpha = 0.4, color = "#2A9D8F") +
+  geom_smooth(method = "loess", se = TRUE, color = "#E76F51", linewidth = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  labs(title = "Residuals vs Fitted (Full Attack Model)",
+       subtitle = "Random scatter around 0 with consistent spread indicates good fit",
+       x = "Fitted Values", y = "Standardized Residuals") +
+  theme_minimal()
+
+grid.arrange(p_resid_fitted, p_scale_loc, ncol = 2)
+```
+
+**Findings:**
+
+- **Simple models** (stat ~ gen) mostly show homoscedasticity — Attack (p = 0.17), HP (p = 0.64), Defense (p = 0.05), Sp.Attack (p = 0.15), and Speed (p = 0.09) all pass the Breusch-Pagan test. Only Sp.Defense is borderline heteroscedastic (p = 0.048).
+- **Full models** with continuous control variables show heteroscedasticity (all p < 0.02), which is expected when predictors have different scales.
+- This heteroscedasticity is not severe and GLM inference remains valid. For extra robustness, we could use heteroscedasticity-consistent standard errors.
+
+## 2.5 Multicollinearity Analysis
+
+```{r correlation-analysis, fig.width=10, fig.height=8}
+# Correlation matrix for predictor variables
+numeric_predictors <- pokemon %>%
+  dplyr::select(attack, hp, defense, sp_attack, sp_defense, speed, 
+                capture_rate, height_m, weight_kg)
+
+cor_matrix <- cor(numeric_predictors, use = "complete.obs")
+
+cat("═══════════════════════════════════════════════════════════════════
+              CORRELATION MATRIX (Combat Stats + Controls)
+═══════════════════════════════════════════════════════════════════\n\n")
+print(round(cor_matrix, 2))
+
+# Visualize
+corrplot(cor_matrix, method = "color", type = "upper",
+         addCoef.col = "black", number.cex = 0.7,
+         tl.col = "black", tl.srt = 45,
+         col = colorRampPalette(c("#264653", "white", "#E76F51"))(200),
+         title = "\nCorrelation Matrix: Combat Stats & Control Variables")
+```
+
+```{r vif-analysis}
+# VIF for full model
+model_vif_check <- lm(attack ~ gen + hp + defense + sp_attack + sp_defense + 
+                       speed + capture_rate + rarity, data = pokemon)
+
+vif_values <- car::vif(model_vif_check)
+
+cat("═══════════════════════════════════════════════════════════════════
+              VARIANCE INFLATION FACTORS (VIF)
+═══════════════════════════════════════════════════════════════════
+VIF > 5: Moderate concern | VIF > 10: Severe multicollinearity
+═══════════════════════════════════════════════════════════════════\n\n")
+
+# Handle both GVIF and regular VIF output
+if(is.matrix(vif_values)) {
+  vif_df <- data.frame(
+    Variable = rownames(vif_values),
+    GVIF = vif_values[, 1],
+    Df = vif_values[, 2],
+    `GVIF^(1/2Df)` = vif_values[, 3]
+  )
+  vif_df[, -1] <- round(vif_df[, -1], 2)
+  print(vif_df, row.names = FALSE)
+  cat("\nNote: For categorical variables, GVIF^(1/2Df) is comparable to standard VIF\n")
+} else {
+  vif_df <- data.frame(Variable = names(vif_values), VIF = vif_values)
+  vif_df$VIF <- round(vif_df$VIF, 2)
+  print(vif_df, row.names = FALSE)
+}
+
+# Assessment
+max_vif <- max(vif_values[, ncol(vif_values)])
+if(max_vif < 5) {
+  cat("\n--- Assessment ---\n✓ All VIF values < 5: No multicollinearity concern\n")
+} else if(max_vif < 10) {
+  cat("\n--- Assessment ---\n⚠ Some VIF values 5-10: Moderate multicollinearity, proceed with caution\n")
+} else {
+  cat("\n--- Assessment ---\n✗ VIF values > 10: Severe multicollinearity, consider removing predictors\n")
+}
+```
+
+**Findings:**
+
+- Moderate correlations exist between combat stats (0.3-0.5 range)
+- No VIF exceeds problematic thresholds
+- **Conclusion**: Multicollinearity is not a concern for our models
+
+## 2.6 Link Function Selection
+
+### Why Identity Link?
+
+```{r link-function-comparison, fig.width=12, fig.height=5}
+# Compare predictions from identity vs log link
+model_identity <- glm(attack ~ gen + hp + defense, data = pokemon, family = gaussian(link = "identity"))
+model_log <- glm(attack ~ gen + hp + defense, data = pokemon, family = gaussian(link = "log"))
+
+comparison_df <- data.frame(
+  Actual = pokemon$attack,
+  Identity_Pred = fitted(model_identity),
+  Log_Pred = fitted(model_log),
+  gen = pokemon$gen
+)
+
+p_identity <- ggplot(comparison_df, aes(x = Actual, y = Identity_Pred)) +
+  geom_point(alpha = 0.4, color = "#2A9D8F") +
+  geom_abline(slope = 1, intercept = 0, color = "red", linewidth = 1.2, linetype = "dashed") +
+  labs(title = "Identity Link: Predicted vs Actual",
+       subtitle = paste("RMSE =", round(sqrt(mean((comparison_df$Actual - comparison_df$Identity_Pred)^2)), 2)),
+       x = "Actual Attack", y = "Predicted Attack") +
+  theme_minimal()
+
+p_log <- ggplot(comparison_df, aes(x = Actual, y = Log_Pred)) +
+  geom_point(alpha = 0.4, color = "#E76F51") +
+  geom_abline(slope = 1, intercept = 0, color = "red", linewidth = 1.2, linetype = "dashed") +
+  labs(title = "Log Link: Predicted vs Actual",
+       subtitle = paste("RMSE =", round(sqrt(mean((comparison_df$Actual - comparison_df$Log_Pred)^2)), 2)),
+       x = "Actual Attack", y = "Predicted Attack") +
+  theme_minimal()
+
+grid.arrange(p_identity, p_log, ncol = 2,
+             top = "Link Function Comparison: Identity vs Log")
+```
+
+**Our Choice: Identity Link**
+
+1. **Interpretable coefficients**: β = "X more attack points"
+2. **No negative prediction risk**: Attack ranges 5-181, well above zero
+3. **No theoretical basis for multiplicative effects**: Power creep likely additive
+4. **Similar predictive accuracy**: Both links perform comparably
+
+## 2.7 Influential Observations Analysis
+
+Individual observations with unusual predictor values or large residuals can disproportionately influence model results. We use Cook's Distance to identify potentially influential points.
+
+```{r influential-observations, fig.width=12, fig.height=8}
+# Fit the full model for influence analysis
+model_influence <- lm(attack ~ gen + hp + defense + sp_attack + sp_defense + 
+                       speed + capture_rate + rarity, data = pokemon)
+
+# Calculate Cook's Distance
+cooks_d <- cooks.distance(model_influence)
+pokemon$cooks_d <- cooks_d
+
+# Identify influential points (Cook's D > 4/n is a common threshold)
+threshold_4n <- 4 / nrow(pokemon)
+threshold_05 <- 0.5
+threshold_10 <- 1.0
+
+influential_4n <- sum(cooks_d > threshold_4n)
+influential_05 <- sum(cooks_d > threshold_05)
+influential_10 <- sum(cooks_d > threshold_10)
+
+cat("═══════════════════════════════════════════════════════════════════
+              COOK'S DISTANCE ANALYSIS
+═══════════════════════════════════════════════════════════════════
+Thresholds for influential observations:
+  • 4/n = ", round(threshold_4n, 4), " (common rule of thumb)
+  • 0.5 (moderate influence)
+  • 1.0 (high influence)
+═══════════════════════════════════════════════════════════════════\n\n")
+
+cat(paste0("Observations exceeding thresholds:\n",
+           "  • Cook's D > 4/n (", round(threshold_4n, 4), "): ", influential_4n, " observations (", 
+           round(100*influential_4n/nrow(pokemon), 1), "%)\n",
+           "  • Cook's D > 0.5: ", influential_05, " observations\n",
+           "  • Cook's D > 1.0: ", influential_10, " observations\n"))
+
+# Show top 10 most influential observations
+top_influential <- pokemon %>%
+  arrange(desc(cooks_d)) %>%
+  dplyr::select(english_name, gen, attack, hp, defense, rarity, cooks_d) %>%
+  head(10)
+
+cat("\n--- Top 10 Most Influential Observations ---\n")
+top_influential$cooks_d <- round(top_influential$cooks_d, 4)
+print(top_influential, row.names = FALSE)
+
+# Plot Cook's Distance
+par(mfrow = c(1, 1), mar = c(4, 4, 3, 1))
+
+# Index plot
+plot(cooks_d, type = "h", main = "Cook's Distance by Observation",
+     xlab = "Observation Index", ylab = "Cook's Distance", col = "#264653")
+abline(h = threshold_05, col = "red", lty = 2, lwd = 2)
+
+
+# Histogram
+hist(cooks_d, breaks = 50, main = "Distribution of Cook's Distance",
+     xlab = "Cook's Distance", col = "#2A9D8F", border = "white")
+abline(v = threshold_4n, col = "orange", lty = 2, lwd = 2)
+```
+
+### Robust Regression Comparison
+
+We compare OLS results with robust regression (Huber M-estimation) to check if outliers are driving our conclusions:
+
+```{r robust-regression}
+# Fit robust regression using Huber M-estimation
+model_robust <- rlm(attack ~ gen + hp + defense + sp_attack + sp_defense + 
+                     speed + capture_rate + rarity, data = pokemon, method = "M")
+
+# Extract generation coefficients from both models
+ols_coefs <- coef(model_influence)
+robust_coefs <- coef(model_robust)
+
+# Compare generation coefficients
+gen_comparison <- data.frame(
+  Generation = paste0("Gen ", 2:9),
+  OLS_Estimate = ols_coefs[grep("^gen", names(ols_coefs))],
+  Robust_Estimate = robust_coefs[grep("^gen", names(robust_coefs))]
+) %>%
+  mutate(
+    Difference = OLS_Estimate - Robust_Estimate,
+    Pct_Difference = round(100 * Difference / abs(OLS_Estimate), 1)
+  )
+
+cat("═══════════════════════════════════════════════════════════════════
+              OLS vs ROBUST REGRESSION COMPARISON
+═══════════════════════════════════════════════════════════════════
+Comparing generation coefficients from:
+  • OLS (ordinary least squares)
+  • Robust regression (Huber M-estimation)
+Similar coefficients indicate outliers are NOT driving results.
+═══════════════════════════════════════════════════════════════════\n\n")
+
+gen_comparison[, 2:4] <- round(gen_comparison[, 2:4], 3)
+print(gen_comparison, row.names = FALSE)
+
+# Summary assessment
+max_pct_diff <- max(abs(gen_comparison$Pct_Difference), na.rm = TRUE)
+if(max_pct_diff < 20) {
+  cat(paste0("\n--- Assessment ---\n",
+             "✓ Maximum coefficient difference: ", max_pct_diff, "%\n",
+             "✓ OLS and Robust estimates are similar — outliers are NOT driving conclusions.\n"))
+} else {
+  cat(paste0("\n--- Assessment ---\n",
+             "⚠ Maximum coefficient difference: ", max_pct_diff, "%\n",
+             "⚠ Some coefficients differ substantially — interpret with caution.\n"))
+}
+```
+
+### Comparison with Outlier-Free Dataset
+
+```{r outlier-free-comparison}
+# Fit model on outlier-free dataset
+model_clean <- lm(attack ~ gen + hp + defense + sp_attack + sp_defense + 
+                   speed + capture_rate + rarity, data = pokemon_clean)
+
+# Compare coefficients
+clean_coefs <- coef(model_clean)
+
+gen_comparison_clean <- data.frame(
+  Generation = paste0("Gen ", 2:9),
+  Full_Data = ols_coefs[grep("^gen", names(ols_coefs))],
+  Outlier_Free = clean_coefs[grep("^gen", names(clean_coefs))]
+) %>%
+  mutate(
+    Difference = Full_Data - Outlier_Free,
+    Consistent_Direction = sign(Full_Data) == sign(Outlier_Free)
+  )
+
+cat("═══════════════════════════════════════════════════════════════════
+              FULL DATA vs OUTLIER-FREE COMPARISON
+═══════════════════════════════════════════════════════════════════\n\n")
+
+cat(paste0("Full dataset: ", nrow(pokemon), " observations\n",
+           "Outlier-free: ", nrow(pokemon_clean), " observations\n",
+           "Removed: ", nrow(pokemon) - nrow(pokemon_clean), " statistical outliers\n\n"))
+
+gen_comparison_clean[, 2:4] <- round(gen_comparison_clean[, 2:4], 3)
+print(gen_comparison_clean, row.names = FALSE)
+
+# Check consistency
+n_consistent <- sum(gen_comparison_clean$Consistent_Direction)
+cat(paste0("\n--- Assessment ---\n",
+           "Direction consistency: ", n_consistent, "/8 generations have same sign\n"))
+if(n_consistent >= 7) {
+  cat("✓ Results are robust to outlier removal.\n")
+} else {
+  cat("⚠ Some generation effects change direction — outliers may be influential.\n")
+}
+```
+
+**Findings:**
+
+- Cook's Distance analysis identifies the most influential observations (typically extreme stat Pokémon).
+- If no observations exceed Cook's D > 1.0 and OLS/Robust estimates are similar, outliers are not problematic.
+- Comparison with outlier-free data verifies robustness of generation effects.
+
+## 2.8 Independence of Observations
+
+GLMs assume observations are independent. We test for potential clustering within generations using intra-class correlation and examine residual patterns.
+
+```{r independence-analysis, fig.width=12, fig.height=6}
+# Calculate Intra-Class Correlation (ICC) for Attack within generations
+# ICC measures how much variance is explained by group membership
+
+# Between-group and within-group variance
+between_var <- var(tapply(pokemon$attack, pokemon$gen, mean))
+within_var <- mean(tapply(pokemon$attack, pokemon$gen, var))
+
+# ICC calculation
+icc <- between_var / (between_var + within_var)
+
+cat("═══════════════════════════════════════════════════════════════════
+              INDEPENDENCE OF OBSERVATIONS ANALYSIS
+═══════════════════════════════════════════════════════════════════\n\n")
+
+cat("--- Intra-Class Correlation (ICC) for Attack by Generation ---\n")
+cat(paste0("Between-generation variance: ", round(between_var, 2), "\n",
+           "Within-generation variance: ", round(within_var, 2), "\n",
+           "ICC = ", round(icc, 4), "\n\n"))
+
+if(icc < 0.1) {
+  cat("✓ ICC < 0.1: Minimal clustering within generations.\n")
+  cat("  Observations can be treated as approximately independent.\n")
+} else if(icc < 0.3) {
+  cat("⚠ ICC between 0.1-0.3: Moderate clustering within generations.\n")
+  cat("  Standard errors may be slightly underestimated, but GLM remains valid.\n")
+} else {
+  cat("✗ ICC > 0.3: Substantial clustering within generations.\n")
+  cat("  Consider mixed-effects models or cluster-robust standard errors.\n")
+}
+
+# Residual patterns by generation
+model_resid <- lm(attack ~ hp + defense + sp_attack + sp_defense + speed + 
+                   capture_rate + rarity, data = pokemon)
+pokemon$residuals <- residuals(model_resid)
+
+# Plot residuals by generation
+p_resid_gen <- ggplot(pokemon, aes(x = gen, y = residuals, fill = gen)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red", linewidth = 1) +
+  scale_fill_viridis_d(option = "plasma") +
+  labs(title = "Residuals by Generation (without gen in model)",
+       subtitle = "If residuals differ by generation, generation should be in the model",
+       x = "Generation", y = "Residuals") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Variance homogeneity across generations (Levene's test)
+levene_result <- car::leveneTest(attack ~ gen, data = pokemon)
+levene_p <- levene_result$`Pr(>F)`[1]
+
+cat("\n--- Levene's Test for Variance Homogeneity Across Generations ---\n")
+cat(paste0("F-statistic: ", round(levene_result$`F value`[1], 3), "\n",
+           "p-value: ", format.pval(levene_p, digits = 4), "\n"))
+
+if(levene_p > 0.05) {
+  cat("✓ Cannot reject equal variances across generations.\n")
+} else {
+  cat("⚠ Variances differ across generations (heteroscedasticity by group).\n")
+  cat("  This is addressed by our heteroscedasticity analysis in Section 2.4.\n")
+}
+
+print(p_resid_gen)
+```
+
+```{r residual-autocorrelation}
+# Check for patterns in residuals (sorted by Pokédex order which correlates with generation)
+# Durbin-Watson test for autocorrelation
+
+# Sort by generation and check for autocorrelation
+pokemon_sorted <- pokemon %>% arrange(gen)
+model_sorted <- lm(attack ~ hp + defense + sp_attack + sp_defense + speed + 
+                    capture_rate + rarity, data = pokemon_sorted)
+
+dw_test <- lmtest::dwtest(model_sorted)
+
+cat("\n--- Durbin-Watson Test for Residual Autocorrelation ---\n")
+cat(paste0("DW statistic: ", round(dw_test$statistic, 4), "\n",
+           "p-value: ", format.pval(dw_test$p.value, digits = 4), "\n"))
+cat("(DW ≈ 2 indicates no autocorrelation; DW < 2 indicates positive autocorrelation)\n\n")
+
+if(dw_test$p.value > 0.05) {
+  cat("✓ No significant autocorrelation detected.\n")
+  cat("  Observations can be treated as independent.\n")
+} else {
+  cat("⚠ Significant autocorrelation detected.\n")
+  cat("  This is expected since generation groups Pokémon sequentially.\n")
+  cat("  Including generation as a predictor addresses this dependency.\n")
+}
+```
+
+**Findings:**
+
+- **ICC interpretation**: Low ICC (< 0.1) indicates minimal within-generation clustering; observations are approximately independent.
+- **Durbin-Watson test**: Tests for sequential autocorrelation in residuals. Any autocorrelation is addressed by including generation in the model.
+- **Levene's test**: Checks if variance differs across generations, complementing our heteroscedasticity analysis.
+
+---
+
+# 3. Summary of Prerequisites
+
+```{r prerequisites-summary}
+cat("╔═══════════════════════════════════════════════════════════════════╗
+║              GLM PREREQUISITES SUMMARY                           ║
+╠═══════════════════════════════════════════════════════════════════╣
+║                                                                   ║
+║  PREDICTOR ENCODING                                              ║
+║  ─────────────────                                               ║
+║  Generation: Categorical factor (Gen 1 = reference)              ║
+║  → 8 coefficients representing difference from Gen 1             ║
+║                                                                   ║
+║  RESPONSE DISTRIBUTION                                           ║
+║  ─────────────────────                                           ║
+║  Most combat stats: Approximately normal (skew 0.28 - 0.96)     ║
+║  HP exception: Skewness 1.51 (high outliers like Blissey)       ║
+║  → Gaussian GLM appropriate for Attack (skew = 0.28)            ║
+║                                                                   ║
+║  VARIANCE STRUCTURE                                              ║
+║  ──────────────────                                              ║
+║  Simple models: Homoscedastic (BP test p > 0.05)                ║
+║  Full models: Mild heteroscedasticity                           ║
+║  → Use robust standard errors for inference                      ║
+║                                                                   ║
+║  MULTICOLLINEARITY                                               ║
+║  ────────────────                                                ║
+║  All VIF < 5: No multicollinearity concern                      ║
+║                                                                   ║
+║  LINK FUNCTION                                                   ║
+║  ─────────────                                                   ║
+║  Primary: Identity (interpretable, additive effects)            ║
+║  Robustness: Log link / Gamma GLM                               ║
+║                                                                   ║
+╚═══════════════════════════════════════════════════════════════════╝\n")
+```
+
+---
+
+# 4. GLM Analysis: Testing for Power Creep
+
+## 4.1 Model Specification
+
+Our primary model:
+
+$$\text{Attack} = \beta_0 + \sum_{g=2}^{9} \beta_g \cdot I(\text{gen} = g) + \gamma_1 \text{HP} + \gamma_2 \text{Defense} + ... + \epsilon$$
+
+Where:
+- $\beta_g$ = difference in Attack for Generation g compared to Generation 1
+- Control variables account for shared variance with other stats
+
+## 4.2 Fitting the Primary Model
+
+```{r fit-primary-model}
+# PRIMARY MODEL: Gaussian GLM with identity link
+model_primary <- glm(attack ~ gen + hp + defense + sp_attack + sp_defense + 
+                      speed + capture_rate + rarity,
+                     data = pokemon, family = gaussian(link = "identity"))
+
+cat("═══════════════════════════════════════════════════════════════════
+           PRIMARY MODEL: Gaussian GLM (Identity Link)
+═══════════════════════════════════════════════════════════════════\n\n")
+
+summary(model_primary)
+
+# Extract generation coefficients
+gen_coefs <- tidy(model_primary) %>%
+  filter(str_detect(term, "^gen")) %>%
+  mutate(
+    generation = as.numeric(str_extract(term, "\\d+")),
+    significant = p.value < 0.05,
+    direction = ifelse(estimate > 0, "Higher than Gen 1", "Lower than Gen 1")
+  )
+
+cat("\n═══════════════════════════════════════════════════════════════════
+           GENERATION COEFFICIENTS (vs Gen 1 baseline)
+═══════════════════════════════════════════════════════════════════\n\n")
+
+gen_coefs_display <- gen_coefs %>%
+  dplyr::select(generation, estimate, std.error, statistic, p.value, significant, direction) %>%
+  mutate(across(c(estimate, std.error, statistic), ~round(., 3)),
+         p.value = format.pval(p.value, digits = 3))
+
+print(gen_coefs_display, row.names = FALSE)
+```
+
+```{r visualize-generation-effects, fig.width=10, fig.height=6}
+# Visualize generation coefficients with confidence intervals
+gen_coefs_plot <- gen_coefs %>%
+  mutate(
+    ci_lower = estimate - 1.96 * std.error,
+    ci_upper = estimate + 1.96 * std.error
+  )
+
+# Add Gen 1 reference (coefficient = 0)
+gen_coefs_plot <- bind_rows(
+  data.frame(term = "gen1", estimate = 0, std.error = NA, statistic = NA, 
+             p.value = NA, generation = 1, significant = NA, 
+             direction = "Reference", ci_lower = 0, ci_upper = 0),
+  gen_coefs_plot
+)
+
+ggplot(gen_coefs_plot, aes(x = factor(generation), y = estimate, fill = significant)) +
+  geom_bar(stat = "identity", alpha = 0.8, color = "black") +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 0.3, linewidth = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red", linewidth = 1.2) +
+  scale_fill_manual(values = c("TRUE" = "#2A9D8F", "FALSE" = "#E9C46A", "NA" = "#264653"),
+                    na.value = "#264653",
+                    labels = c("TRUE" = "p < 0.05", "FALSE" = "p ≥ 0.05", "NA" = "Reference")) +
+  labs(title = "Generation Effects on Attack (vs Gen 1 Baseline)",
+       subtitle = "Controlling for HP, Defense, Sp.Attack, Sp.Defense, Speed, Capture Rate, Rarity",
+       x = "Generation", y = "Coefficient (Attack Points)",
+       fill = "Significance") +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(size = 12, face = "bold"))
+```
+
+## 4.3 Likelihood Ratio Test: Does Generation Matter?
+
+```{r lr-test}
+# Null model (without generation)
+model_null <- glm(attack ~ hp + defense + sp_attack + sp_defense + 
+                   speed + capture_rate + rarity,
+                  data = pokemon, family = gaussian(link = "identity"))
+
+# Likelihood ratio test
+lr_test <- anova(model_null, model_primary, test = "Chisq")
+
+cat("═══════════════════════════════════════════════════════════════════
+           LIKELIHOOD RATIO TEST: Does Generation Matter?
+═══════════════════════════════════════════════════════════════════
+H0: Generation has no effect on Attack
+H1: At least one generation differs from Generation 1
+═══════════════════════════════════════════════════════════════════\n\n")
+
+print(lr_test)
+
+lr_p_value <- lr_test$`Pr(>Chi)`[2]
+if(lr_p_value < 0.05) {
+  cat(paste0("\n--- Conclusion ---\n",
+             "✓ p = ", format.pval(lr_p_value, digits = 4), " < 0.05\n",
+             "→ REJECT H0: Generation significantly affects Attack\n"))
+} else {
+  cat(paste0("\n--- Conclusion ---\n",
+             "✗ p = ", format.pval(lr_p_value, digits = 4), " ≥ 0.05\n",
+             "→ FAIL TO REJECT H0: No significant generation effect\n"))
+}
+```
+
+## 4.4 Testing All Combat Stats
+
+```{r test-all-stats}
+# Function to fit GLM and extract generation p-value
+fit_and_test <- function(data, response_var) {
+  # Build formula with controls (excluding response from controls)
+  all_controls <- c("hp", "attack", "defense", "sp_attack", "sp_defense", "speed")
+  controls <- setdiff(all_controls, response_var)
+  
+  formula_full <- as.formula(paste(response_var, "~ gen +", 
+                                   paste(controls, collapse = " + "),
+                                   "+ capture_rate + rarity"))
+  formula_null <- as.formula(paste(response_var, "~", 
+                                   paste(controls, collapse = " + "),
+                                   "+ capture_rate + rarity"))
+  
+  model_full <- glm(formula_full, data = data, family = gaussian(link = "identity"))
+  model_null <- glm(formula_null, data = data, family = gaussian(link = "identity"))
+  
+  # LR test
+  lr_test <- anova(model_null, model_full, test = "Chisq")
+  
+  # Extract generation coefficients
+  gen_coefs <- tidy(model_full) %>%
+    filter(str_detect(term, "^gen")) %>%
+    dplyr::select(term, estimate, p.value)
+  
+  # Count significant positive coefficients
+  sig_positive <- sum(gen_coefs$estimate > 0 & gen_coefs$p.value < 0.05)
+  sig_negative <- sum(gen_coefs$estimate < 0 & gen_coefs$p.value < 0.05)
+  
+  return(list(
+    stat = response_var,
+    lr_p_value = lr_test$`Pr(>Chi)`[2],
+    gen_significant = lr_test$`Pr(>Chi)`[2] < 0.05,
+    sig_positive = sig_positive,
+    sig_negative = sig_negative,
+    coefficients = gen_coefs
+  ))
+}
+
+# Test all individual stats
+all_stats <- c("hp", "attack", "defense", "sp_attack", "sp_defense", "speed")
+stat_labels <- c("HP", "Attack", "Defense", "Sp.Attack", "Sp.Defense", "Speed")
+
+results_list <- lapply(all_stats, function(s) fit_and_test(pokemon, s))
+names(results_list) <- all_stats
+
+# Summary table
+results_summary <- data.frame(
+  Stat = stat_labels,
+  LR_p_value = sapply(results_list, function(x) x$lr_p_value),
+  Generation_Significant = sapply(results_list, function(x) x$gen_significant),
+  Sig_Higher_Than_Gen1 = sapply(results_list, function(x) x$sig_positive),
+  Sig_Lower_Than_Gen1 = sapply(results_list, function(x) x$sig_negative)
+)
+
+cat("═══════════════════════════════════════════════════════════════════
+           GLM RESULTS: ALL COMBAT STATS
+═══════════════════════════════════════════════════════════════════
+Likelihood Ratio Test: H0 = Generation has no effect
+═══════════════════════════════════════════════════════════════════\n\n")
+
+results_summary$LR_p_value <- format.pval(results_summary$LR_p_value, digits = 4)
+print(results_summary, row.names = FALSE)
+```
+
+```{r visualize-all-stats-effects, fig.width=14, fig.height=10}
+# Extract all coefficients for visualization
+all_coefs <- bind_rows(lapply(names(results_list), function(stat) {
+  results_list[[stat]]$coefficients %>%
+    mutate(stat = stat,
+           generation = as.numeric(str_extract(term, "\\d+")))
+}))
+
+# Add reference level
+reference_rows <- data.frame(
+  term = rep("gen1", 6),
+  estimate = 0,
+  p.value = NA,
+  stat = all_stats,
+  generation = 1
+)
+
+all_coefs_complete <- bind_rows(reference_rows, all_coefs) %>%
+  mutate(significant = ifelse(is.na(p.value), "Reference", 
+                              ifelse(p.value < 0.05, "Significant", "Not significant")),
+         stat_label = factor(stat, levels = all_stats, labels = stat_labels))
+
+# Faceted coefficient plot
+ggplot(all_coefs_complete, aes(x = factor(generation), y = estimate, fill = significant)) +
+  geom_bar(stat = "identity", alpha = 0.8, color = "black", linewidth = 0.3) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red", linewidth = 0.8) +
+  facet_wrap(~stat_label, scales = "free_y", ncol = 3) +
+  scale_fill_manual(values = c("Significant" = "#2A9D8F", 
+                               "Not significant" = "#E9C46A", 
+                               "Reference" = "#264653")) +
+  labs(title = "Generation Effects Across All Combat Stats",
+       subtitle = "Each coefficient represents difference from Generation 1 (controlled for other stats)",
+       x = "Generation", y = "Coefficient (Stat Points)",
+       fill = "Significance") +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        strip.text = element_text(size = 12, face = "bold"))
+```
+
+## 4.5 Jonckheere-Terpstra Trend Test
+
+Tests for monotonic trend across ordered generations:
+
+```{r jt-test, fig.width=10, fig.height=6}
+# Jonckheere-Terpstra test for each stat
+jt_results <- data.frame(
+  Stat = character(),
+  JT_Statistic = numeric(),
+  p_value = numeric(),
+  Direction = character(),
+  stringsAsFactors = FALSE
+)
+
+for(i in seq_along(all_stats)) {
+  stat_var <- all_stats[i]
+  stat_label <- stat_labels[i]
+  
+  # Run JT test
+  jt_test <- JonckheereTerpstraTest(
+    pokemon[[stat_var]] ~ pokemon$gen,
+    alternative = "increasing"
+  )
+  
+  jt_results <- rbind(jt_results, data.frame(
+    Stat = stat_label,
+    JT_Statistic = jt_test$statistic,
+    p_value = jt_test$p.value,
+    Direction = ifelse(jt_test$p.value < 0.05, "Increasing trend", "No significant trend")
+  ))
+}
+
+cat("═══════════════════════════════════════════════════════════════════
+           JONCKHEERE-TERPSTRA TREND TEST
+═══════════════════════════════════════════════════════════════════
+H0: No monotonic trend across generations
+H1: Increasing trend (later generations have higher stats)
+═══════════════════════════════════════════════════════════════════\n\n")
+
+jt_results$p_value <- format.pval(jt_results$p_value, digits = 4)
+print(jt_results, row.names = FALSE)
+```
+
+## 4.6 Robustness Check: Gamma GLM
+
+```{r gamma-glm}
+# Gamma GLM with log link for Attack
+model_gamma <- glm(attack ~ gen + hp + defense + sp_attack + sp_defense + 
+                    speed + capture_rate + rarity,
+                   data = pokemon, family = Gamma(link = "log"))
+
+cat("═══════════════════════════════════════════════════════════════════
+           ROBUSTNESS CHECK: Gamma GLM (Log Link)
+═══════════════════════════════════════════════════════════════════\n\n")
+
+# Extract generation coefficients
+gamma_coefs <- tidy(model_gamma) %>%
+  filter(str_detect(term, "^gen")) %>%
+  mutate(
+    generation = as.numeric(str_extract(term, "\\d+")),
+    # Convert to percentage change
+    pct_change = (exp(estimate) - 1) * 100,
+    significant = p.value < 0.05
+  )
+
+gamma_display <- gamma_coefs %>%
+  dplyr::select(generation, estimate, pct_change, p.value, significant) %>%
+  mutate(across(c(estimate, pct_change), ~round(., 3)),
+         p.value = format.pval(p.value, digits = 3))
+
+cat("Coefficients are on log scale. exp(coef) - 1 = % change from Gen 1\n\n")
+print(gamma_display, row.names = FALSE)
+
+# Compare Gaussian vs Gamma
+cat("\n═══════════════════════════════════════════════════════════════════
+           COMPARISON: Gaussian vs Gamma Models
+═══════════════════════════════════════════════════════════════════\n\n")
+
+comparison_models <- data.frame(
+  Model = c("Gaussian (Identity)", "Gamma (Log)"),
+  AIC = c(AIC(model_primary), AIC(model_gamma)),
+  BIC = c(BIC(model_primary), BIC(model_gamma))
+)
+comparison_models[, c("AIC", "BIC")] <- round(comparison_models[, c("AIC", "BIC")], 2)
+print(comparison_models, row.names = FALSE)
+cat("\nLower AIC/BIC indicates better fit.\n")
+```
+
+## 4.7 Robustness Check: Normal-Only Pokémon
+
+```{r normal-only-analysis}
+# Fit model on Normal-rarity Pokémon only
+model_normal <- glm(attack ~ gen + hp + defense + sp_attack + sp_defense + 
+                     speed + capture_rate,
+                    data = pokemon_normal, family = gaussian(link = "identity"))
+
+cat(paste0("═══════════════════════════════════════════════════════════════════
+           ROBUSTNESS CHECK: Normal-Rarity Pokémon Only
+           (Excluding Legendaries, Sub-legendaries, Mythicals)
+═══════════════════════════════════════════════════════════════════
+Sample size: ", nrow(pokemon_normal), " Pokémon\n\n"))
+
+# Extract generation coefficients
+normal_coefs <- tidy(model_normal) %>%
+  filter(str_detect(term, "^gen")) %>%
+  mutate(
+    generation = as.numeric(str_extract(term, "\\d+")),
+    significant = p.value < 0.05
+  )
+
+normal_display <- normal_coefs %>%
+  dplyr::select(generation, estimate, std.error, p.value, significant) %>%
+  mutate(across(c(estimate, std.error), ~round(., 3)),
+         p.value = format.pval(p.value, digits = 3))
+
+print(normal_display, row.names = FALSE)
+
+# LR test for Normal-only
+model_normal_null <- glm(attack ~ hp + defense + sp_attack + sp_defense + 
+                          speed + capture_rate,
+                         data = pokemon_normal, family = gaussian(link = "identity"))
+
+lr_normal <- anova(model_normal_null, model_normal, test = "Chisq")
+
+if(lr_normal$`Pr(>Chi)`[2] < 0.05) {
+  cat(paste0("\n--- Likelihood Ratio Test (Normal-Only) ---\n",
+             "p-value: ", format.pval(lr_normal$`Pr(>Chi)`[2], digits = 4), "\n",
+             "→ Generation significantly affects Attack even among Normal-rarity Pokémon\n"))
+} else {
+  cat(paste0("\n--- Likelihood Ratio Test (Normal-Only) ---\n",
+             "p-value: ", format.pval(lr_normal$`Pr(>Chi)`[2], digits = 4), "\n",
+             "→ Generation effect not significant among Normal-rarity Pokémon\n"))
+}
+```
+
+```{r compare-full-vs-normal, fig.width=12, fig.height=6}
+# Compare coefficients: Full dataset vs Normal-only
+coef_comparison <- gen_coefs %>%
+  dplyr::select(generation, estimate, significant) %>%
+  rename(Full_Estimate = estimate, Full_Sig = significant) %>%
+  left_join(
+    normal_coefs %>%
+      dplyr::select(generation, estimate, significant) %>%
+      rename(Normal_Estimate = estimate, Normal_Sig = significant),
+    by = "generation"
+  )
+
+# Add Gen 1 reference
+coef_comparison <- bind_rows(
+  data.frame(generation = 1, Full_Estimate = 0, Full_Sig = NA, 
+             Normal_Estimate = 0, Normal_Sig = NA),
+  coef_comparison
+)
+
+# Reshape for plotting
+coef_long <- coef_comparison %>%
+  pivot_longer(cols = c(Full_Estimate, Normal_Estimate),
+               names_to = "Dataset", values_to = "Coefficient") %>%
+  mutate(Dataset = ifelse(Dataset == "Full_Estimate", "Full Dataset", "Normal-Only"))
+
+ggplot(coef_long, aes(x = factor(generation), y = Coefficient, fill = Dataset)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), alpha = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red", linewidth = 1) +
+  scale_fill_manual(values = c("Full Dataset" = "#264653", "Normal-Only" = "#2A9D8F")) +
+  labs(title = "Generation Effects: Full Dataset vs Normal-Only",
+       subtitle = "Testing whether power creep exists independent of legendary/mythical Pokémon",
+       x = "Generation", y = "Coefficient (Attack Points)",
+       fill = "Dataset") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+## 4.8 Effect Size Analysis
+
+```{r effect-sizes}
+# Calculate Cohen's d for each generation vs Gen 1
+gen1_attack <- pokemon$attack[pokemon$gen == "1"]
+
+cohens_d <- data.frame(
+  Generation = 2:9,
+  Cohens_d = sapply(2:9, function(g) {
+    gen_attack <- pokemon$attack[pokemon$gen == as.character(g)]
+    mean_diff <- mean(gen_attack) - mean(gen1_attack)
+    pooled_sd <- sqrt(((length(gen1_attack)-1)*var(gen1_attack) + 
+                        (length(gen_attack)-1)*var(gen_attack)) / 
+                       (length(gen1_attack) + length(gen_attack) - 2))
+    return(mean_diff / pooled_sd)
+  })
+) %>%
+  mutate(
+    Magnitude = case_when(
+      abs(Cohens_d) < 0.2 ~ "Negligible",
+      abs(Cohens_d) < 0.5 ~ "Small",
+      abs(Cohens_d) < 0.8 ~ "Medium",
+      TRUE ~ "Large"
+    )
+  )
+
+cat("═══════════════════════════════════════════════════════════════════
+           EFFECT SIZE ANALYSIS: Cohen's d
+═══════════════════════════════════════════════════════════════════
+Cohen's d thresholds: |d| < 0.2 = negligible, 0.2-0.5 = small,
+                      0.5-0.8 = medium, > 0.8 = large
+═══════════════════════════════════════════════════════════════════\n\n")
+
+cohens_d$Cohens_d <- round(cohens_d$Cohens_d, 3)
+print(cohens_d, row.names = FALSE)
+```
+
+```{r visualize-effect-sizes, fig.width=10, fig.height=5}
+# Add Gen 1 reference
+cohens_d_plot <- bind_rows(
+  data.frame(Generation = 1, Cohens_d = 0, Magnitude = "Reference"),
+  cohens_d
+)
+
+ggplot(cohens_d_plot, aes(x = factor(Generation), y = Cohens_d, fill = Magnitude)) +
+  geom_bar(stat = "identity", alpha = 0.8, color = "black") +
+  geom_hline(yintercept = c(-0.2, 0.2), linetype = "dotted", color = "gray50") +
+  geom_hline(yintercept = c(-0.5, 0.5), linetype = "dashed", color = "gray50") +
+  geom_hline(yintercept = 0, color = "red", linewidth = 1) +
+  scale_fill_manual(values = c("Reference" = "#264653", "Negligible" = "#E9C46A", 
+                               "Small" = "#F4A261", "Medium" = "#E76F51", 
+                               "Large" = "#9B5DE5")) +
+  annotate("text", x = 9.5, y = 0.2, label = "Small", size = 3, hjust = 0) +
+  annotate("text", x = 9.5, y = 0.5, label = "Medium", size = 3, hjust = 0) +
+  labs(title = "Practical Significance: Cohen's d by Generation",
+       subtitle = "Comparing each generation's Attack to Generation 1",
+       x = "Generation", y = "Cohen's d",
+       fill = "Effect Size") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+---
+
+# 5. Conclusions
+
+```{r final-summary}
+# Build summary output dynamically
+lr_sig <- lr_test$`Pr(>Chi)`[2] < 0.05
+n_pos_sig <- sum(gen_coefs$estimate > 0 & gen_coefs$p.value < 0.05)
+n_neg_sig <- sum(gen_coefs$estimate < 0 & gen_coefs$p.value < 0.05)
+normal_sig <- lr_normal$`Pr(>Chi)`[2] < 0.05
+max_d <- max(abs(cohens_d$Cohens_d))
+
+# Build criterion 1 line
+crit1_line <- ifelse(lr_sig,
+  "║  ✓ Generation is a SIGNIFICANT predictor (LR test p < 0.05)     ║",
+  "║  ✗ Generation is NOT a significant predictor (LR test p ≥ 0.05) ║")
+
+# Build criterion 3 line
+crit3_line <- ifelse(normal_sig,
+  "║  • Normal-only analysis: Effect persists (not driven by legends)║",
+  "║  • Normal-only analysis: Effect diminished/lost                 ║")
+
+# Build final verdict lines
+if(lr_sig && n_pos_sig > 0) {
+  verdict_lines <- "║  Evidence supports POWER CREEP in Pokémon Attack stats.        ║\n║  Later generations show significantly higher Attack.            ║"
+} else if(lr_sig) {
+  verdict_lines <- "║  Generation differences exist but not consistent power creep.  ║"
+} else {
+  verdict_lines <- "║  No significant evidence of power creep detected.               ║"
+}
+
+# Output entire summary as single block
+cat(paste0(
+"╔═══════════════════════════════════════════════════════════════════╗
+║                    POWER CREEP ANALYSIS SUMMARY                  ║
+╠═══════════════════════════════════════════════════════════════════╣
+║                                                                   ║
+║  CRITERION 1: Statistical Significance                           ║
+║  ─────────────────────────────────────                           ║
+", crit1_line, "
+║                                                                   ║
+║  CRITERION 2: Direction of Effect                                ║
+║  ────────────────────────────────                                ║
+", sprintf("║  %d generations have significantly HIGHER Attack than Gen 1     ║", n_pos_sig), "
+", sprintf("║  %d generations have significantly LOWER Attack than Gen 1      ║", n_neg_sig), "
+║                                                                   ║
+║  CRITERION 3: Robustness                                         ║
+║  ──────────────────────                                          ║
+║  • Gaussian & Gamma GLMs: Similar conclusions                    ║
+", crit3_line, "
+║                                                                   ║
+║  CRITERION 4: Practical Significance                             ║
+║  ─────────────────────────────────                               ║
+", sprintf("║  Maximum Cohen's d = %.2f (%s effect)                      ║", 
+           max_d, cohens_d$Magnitude[which.max(abs(cohens_d$Cohens_d))]), "
+║                                                                   ║
+╠═══════════════════════════════════════════════════════════════════╣
+║                                                                   ║
+║  FINAL VERDICT                                                   ║
+║  ────────────                                                    ║
+", verdict_lines, "
+║                                                                   ║
+╚═══════════════════════════════════════════════════════════════════╝
+"))
+```
+
+## 5.1 Key Findings Summary
+
+Based on our analysis, we found **statistically significant evidence of power creep** in Pokémon combat statistics:
+
+1. **Generation significantly predicts Attack** (LR test p = 0.001): After controlling for HP, Defense, Sp.Attack, Sp.Defense, Speed, Capture Rate, and Rarity, generation remains a significant predictor of Attack.
+
+2. **Generation 5 stands out**: Only Generation 5 shows a statistically significant increase over Generation 1 (+5.53 Attack points, p = 0.024). Other generations show positive trends (Gen 3, 4, 7, 8, 9) but do not reach significance at α = 0.05.
+
+3. **Monotonic trend across ALL stats**: The Jonckheere-Terpstra test reveals significant increasing trends for all six combat statistics:
+   - HP (p < 0.001)
+   - Attack (p < 0.001)
+   - Defense (p < 0.001)
+   - Sp.Attack (p = 0.024)
+   - Sp.Defense (p = 0.013)
+   - Speed (p = 0.028)
+
+4. **Effect persists among Normal-rarity Pokémon**: The generation effect remains significant (p < 0.001) even when excluding legendaries and mythicals, confirming power creep affects "regular" Pokémon.
+
+5. **Small but real effect size**: Maximum Cohen's d = 0.41 (small effect). While statistically significant, the practical magnitude is modest — approximately 5-6 Attack points difference between Gen 1 and the highest generations.
+
+## 5.2 Interpretation Notes
+
+1. **Model specification matters**: Control variables isolate the generation effect from correlated stat differences. Without controls, we might confuse "higher stats overall" with "higher Attack specifically."
+
+2. **Categorical vs numeric generation**: Using categorical encoding reveals non-monotonic patterns. Gen 2 and Gen 6 actually dip slightly below Gen 1, which a simple linear trend would miss.
+
+3. **Robustness confirmed**: Both Gaussian and Gamma GLMs yield similar conclusions. The effect persists in Normal-only analysis.
+
+4. **Statistical vs practical significance**: With 1000+ observations, we can detect small effects. The effect size (Cohen's d ≈ 0.4) indicates a small but real difference — noticeable to competitive players but not game-breaking.
+
+---
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
+

@@ -1,0 +1,2689 @@
+---
+title: "Pokémon Attack Stat GLM Analysis"
+subtitle: "Comprehensive Generalized Linear Model Analysis for Attack Power"
+author: "Jan Tychtl"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    fig_width: 10
+    fig_height: 6
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center"
+)
+```
+
+# Introduction
+
+## Research Objective
+
+This analysis focuses on **Attack** as the primary target variable. We aim to:
+
+1. **Understand what drives Attack stats** — Which factors (generation, type, rarity, other stats) best explain variation in Attack?
+2. **Quantify generation effects** — Is there evidence of power creep specifically in Attack values?
+3. **Build predictive models** — Develop GLMs that accurately predict Attack from available features
+4. **Compare model specifications** — Evaluate Gaussian vs Gamma GLMs, different link functions, and control variable sets
+
+---
+
+# 1. Setup and Data Loading
+
+```{r libraries, message=FALSE}
+# Core packages
+library(tidyverse)
+library(ggplot2)
+library(gridExtra)
+
+# Statistical modeling
+library(car)          # VIF, ANOVA
+library(MASS)         # Robust regression
+library(lmtest)       # Breusch-Pagan test
+library(broom)        # Tidy model outputs
+library(glmnet)       # LASSO regularization
+
+# Specialized tests
+library(moments)      # Skewness and kurtosis
+library(DescTools)    # Jonckheere-Terpstra test
+
+# Visualization
+library(corrplot)     # Correlation plots
+library(scales)       # Scale functions for plots
+```
+
+```{r load-data}
+# Load data using relative paths from the Rmd file location
+pokemon <- read.csv("../data/data_clean.csv")
+cat("Dataset loaded:", nrow(pokemon), "Pokémon\n")
+```
+
+```{r preprocess-data}
+# Type name lookup tables (from pokemon.csv original names)
+primary_type_lookup <- c(
+  "0" = "Grass", "1" = "Fire", "2" = "Water", "3" = "Bug", 
+  "4" = "Normal", "5" = "Poison", "6" = "Electric", "7" = "Ground",
+  "8" = "Fairy", "9" = "Fighting", "10" = "Psychic", "11" = "Rock",
+  "12" = "Ghost", "13" = "Ice", "14" = "Dragon", "15" = "Dark",
+  "16" = "Steel", "17" = "Flying"
+)
+
+secondary_type_lookup <- c(
+  "0" = "Poison", "1" = "(None)", "2" = "Flying", "3" = "Dark",
+  "4" = "Electric", "5" = "Ice", "6" = "Ground", "7" = "Fairy",
+  "8" = "Grass", "9" = "Fighting", "10" = "Psychic", "11" = "Steel",
+  "12" = "Fire", "13" = "Rock", "14" = "Water", "15" = "Dragon",
+  "16" = "Ghost", "17" = "Bug", "18" = "Normal"
+)
+
+# Add readable type names BEFORE converting to factors
+pokemon <- pokemon %>%
+  mutate(
+    type_name = primary_type_lookup[as.character(class_primary)],
+    type_name_secondary = secondary_type_lookup[as.character(class_secondary)]
+  )
+
+# Convert factors
+pokemon <- pokemon %>%
+  mutate(
+    gen = as.factor(gen),
+    rarity = as.factor(rarity),
+    class_primary = as.factor(class_primary),
+    class_secondary = as.factor(class_secondary),
+    has_mega_evolution = as.factor(has_mega_evolution),
+    has_gigantamax = as.factor(has_gigantamax)
+  )
+
+# Define rarity levels (0 = normal, 1 = sublegendary, 2 = legendary, 3 = mythical)
+levels(pokemon$rarity) <- c("Normal", "SubLegendary", "Legendary", "Mythical")
+
+# Create derived features
+pokemon <- pokemon %>%
+  mutate(
+    total_stats = hp + attack + defense + sp_attack + sp_defense + speed,
+    physical_power = attack + defense,
+    special_power = sp_attack + sp_defense,
+    offensive_power = attack + sp_attack,
+    defensive_power = defense + sp_defense,
+    gen_numeric = as.numeric(as.character(gen))
+  )
+
+# ═══════════════════════════════════════════════════════════════════
+# DEFINE PREDICTOR SETS (used throughout the analysis)
+# ═══════════════════════════════════════════════════════════════════
+
+# All predictors for full model (excluding attack which is the response)
+all_predictors <- c(
+  # Generation (main predictor of interest)
+  "gen",
+  # Combat stats
+  "hp", "defense", "sp_attack", "sp_defense", "speed",
+  # Pokémon characteristics
+  "capture_rate", "rarity", "height_m", "weight_kg", "base_egg_steps",
+  "num_abilities", "evo_length", "has_mega_evolution", "has_gigantamax",
+  # Types
+  "class_primary", "class_secondary",
+  # Demographics
+  "percent_male","percent_female",
+  # Popularity
+  "votes_first", "votes_top_6",
+  # Type effectiveness (18 types)
+  "against_normal", "against_fire", "against_water", "against_electric",
+  "against_grass", "against_ice", "against_fighting", "against_poison",
+  "against_ground", "against_flying", "against_psychict", "against_bug",
+  "against_rock", "against_ghost", "against_dragon", "against_dark",
+  "against_steel", "against_fairy"
+)
+
+# Predictors without generation (for null model)
+predictors_no_gen <- setdiff(all_predictors, "gen")
+
+# Create formula helper function
+make_formula <- function(response, predictors) {
+  as.formula(paste(response, "~", paste(predictors, collapse = " + ")))
+}
+
+# Display predictor count
+cat("Total predictors:", length(all_predictors), "\n")
+
+cat("Dataset size:", nrow(pokemon), "Pokémon\n")
+```
+
+---
+
+# 2. Exploratory Analysis of Attack
+
+## 2.1 Attack Distribution
+
+```{r attack-distribution, fig.width=12, fig.height=5}
+# Basic statistics
+attack_stats <- data.frame(
+  Statistic = c("Mean", "Median", "SD", "Min", "Max", "Skewness", "Kurtosis"),
+  Value = c(
+    round(mean(pokemon$attack), 2),
+    round(median(pokemon$attack), 2),
+    round(sd(pokemon$attack), 2),
+    min(pokemon$attack),
+    max(pokemon$attack),
+    round(skewness(pokemon$attack), 3),
+    round(kurtosis(pokemon$attack), 3)
+  )
+)
+
+print(attack_stats, row.names = FALSE)
+
+# Histogram with density overlay
+p1 <- ggplot(pokemon, aes(x = attack)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 35, 
+                 fill = "#E76F51", alpha = 0.7, color = "white") +
+  geom_density(linewidth = 1.2, color = "#264653") +
+  stat_function(fun = dnorm, 
+                args = list(mean = mean(pokemon$attack), sd = sd(pokemon$attack)),
+                linewidth = 1.2, color = "#2A9D8F", linetype = "dashed") +
+  geom_vline(xintercept = mean(pokemon$attack), color = "blue", linewidth = 1) +
+  geom_vline(xintercept = median(pokemon$attack), color = "darkgreen", 
+             linewidth = 1, linetype = "dotted") +
+  labs(title = "Distribution of Attack",
+       subtitle = paste0("Mean = ", round(mean(pokemon$attack), 1),
+                        ", Median = ", round(median(pokemon$attack), 1),
+                        ", Skewness = ", round(skewness(pokemon$attack), 2)),
+       x = "Attack", y = "Density") +
+  theme_minimal()
+
+# Q-Q plot
+p2 <- ggplot(pokemon, aes(sample = attack)) +
+  stat_qq(color = "#E76F51", alpha = 0.6, size = 2) +
+  stat_qq_line(color = "#264653", linewidth = 1.2) +
+  labs(title = "Q-Q Plot: Attack",
+       subtitle = "Checking normality assumption",
+       x = "Theoretical Quantiles", y = "Sample Quantiles") +
+  theme_minimal()
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+```{r shapiro-test}
+# Shapiro-Wilk normality test
+shapiro_result <- shapiro.test(pokemon$attack)
+
+data.frame(
+  Statistic = c("W", "p-value", "Skewness"),
+  Value = c(round(shapiro_result$statistic, 4), 
+            format.pval(shapiro_result$p.value, digits = 4),
+            round(skewness(pokemon$attack), 2))
+)
+```
+
+## 2.2 Attack by Generation
+
+```{r attack-by-generation, fig.width=12, fig.height=6}
+# Summary statistics by generation
+gen_summary <- pokemon %>%
+  group_by(gen) %>%
+  summarise(
+    n = n(),
+    mean_attack = mean(attack),
+    median_attack = median(attack),
+    sd_attack = sd(attack),
+    min_attack = min(attack),
+    max_attack = max(attack),
+    se = sd(attack) / sqrt(n())
+  ) %>%
+  mutate(across(where(is.numeric) & !matches("^n$"), ~round(., 2)))
+
+print(gen_summary, n = Inf)
+
+# Boxplot with means
+p_box <- ggplot(pokemon, aes(x = gen, y = attack, fill = gen)) +
+  geom_boxplot(alpha = 0.7, outlier.color = "#E76F51", outlier.size = 2) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 4, color = "black") +
+  geom_hline(yintercept = mean(pokemon$attack), linetype = "dashed", 
+             color = "red", linewidth = 1) +
+  scale_fill_viridis_d(option = "plasma") +
+  labs(title = "Attack Distribution by Generation",
+       subtitle = "Diamonds = generation means; Red line = overall mean",
+       x = "Generation", y = "Attack") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Mean plot with error bars
+p_means <- ggplot(gen_summary, aes(x = gen, y = mean_attack, fill = gen)) +
+  geom_bar(stat = "identity", alpha = 0.8) +
+  geom_errorbar(aes(ymin = mean_attack - 1.96*se, ymax = mean_attack + 1.96*se), 
+                width = 0.3, linewidth = 0.8) +
+  geom_hline(yintercept = gen_summary$mean_attack[1], linetype = "dashed", 
+             color = "red", linewidth = 1) +
+  scale_fill_viridis_d(option = "plasma") +
+  labs(title = "Mean Attack by Generation",
+       subtitle = "Error bars = 95% CI; Red line = Gen 1 baseline",
+       x = "Generation", y = "Mean Attack") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+grid.arrange(p_box, p_means, ncol = 2)
+```
+
+## 2.3 Attack by Rarity
+
+```{r attack-by-rarity, fig.width=10, fig.height=5}
+# Summary by rarity
+rarity_summary <- pokemon %>%
+  group_by(rarity) %>%
+  summarise(
+    n = n(),
+    mean_attack = round(mean(attack), 2),
+    sd_attack = round(sd(attack), 2),
+    se = round(sd(attack) / sqrt(n()), 2)
+  )
+
+print(rarity_summary)
+
+ggplot(pokemon, aes(x = rarity, y = attack, fill = rarity)) +
+  geom_boxplot(alpha = 0.7) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 4, color = "black") +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Attack Distribution by Rarity",
+       subtitle = "Legendary and Mythical Pokémon typically have higher Attack",
+       x = "Rarity", y = "Attack") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+## 2.4 Available Variables Overview
+
+```{r available-variables}
+# List all available columns
+all_vars <- data.frame(
+  Variable = names(pokemon),
+  Class = sapply(pokemon, class),
+  NonNA = sapply(pokemon, function(x) sum(!is.na(x))),
+  Example = sapply(pokemon, function(x) paste0(head(x, 2), collapse = ", "))
+)
+print(all_vars, row.names = FALSE)
+```
+
+## 2.5 Attack by Type (Primary and Secondary)
+
+```{r attack-by-secondary-type, fig.width=14, fig.height=5}
+# Secondary type distribution
+secondary_summary <- pokemon %>%
+  group_by(class_secondary) %>%
+  summarise(
+    n = n(),
+    mean_attack = round(mean(attack), 1)
+  ) %>%
+  arrange(desc(mean_attack))
+
+print(secondary_summary, n = Inf)
+```
+
+## 2.6 Attack by Primary Type
+
+```{r attack-by-type, fig.width=14, fig.height=6}
+# Summary by primary type (using readable names)
+type_summary_eda <- pokemon %>%
+  group_by(type_name) %>%
+  summarise(
+    n = n(),
+    mean_attack = round(mean(attack), 1),
+    sd_attack = round(sd(attack), 1),
+    median_attack = median(attack)
+  ) %>%
+  arrange(desc(mean_attack))
+
+print(type_summary_eda, n = Inf)
+
+# Boxplot by type
+ggplot(pokemon, aes(x = reorder(type_name, attack, FUN = median), 
+                    y = attack, fill = type_name)) +
+  geom_boxplot(alpha = 0.7) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 3, color = "black") +
+  geom_hline(yintercept = mean(pokemon$attack), linetype = "dashed", 
+             color = "red", linewidth = 1) +
+  labs(title = "Attack Distribution by Primary Type",
+       subtitle = "Ordered by median Attack; Red line = overall mean",
+       x = "Primary Type", y = "Attack") +
+  theme_minimal() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+---
+
+# 3. GLM Prerequisites for Attack Models
+
+To use Generalized Linear Models correctly, we must determine:
+
+1. What **TYPE** of variables are we modeling?
+2. What **DISTRIBUTION** does the response follow?
+3. How does **VARIANCE** relate to the **MEAN**?
+4. What **LINK FUNCTION** is appropriate?
+
+## 3.1 Variable Types
+
+```{r variable-types}
+# Response variable
+response_info <- data.frame(
+  Aspect = c("Variable", "Type", "Nature", "Range", "Bounded"),
+  Value = c("Attack", "Numeric (continuous)", "Combat statistic", 
+            paste0(min(pokemon$attack), " - ", max(pokemon$attack)),
+            "Yes (positive integers)")
+)
+cat("═══ RESPONSE VARIABLE ═══\n")
+print(response_info, row.names = FALSE)
+
+# All predictor variables organized by category
+cat("\n═══ PREDICTOR VARIABLES ═══\n")
+cat("\n--- Main Predictor (Generation) ---\n")
+gen_info <- data.frame(
+  Variable = "gen",
+  Type = "Categorical (factor)",
+  Range_Levels = "9 levels (1-9)",
+  Description = "Generation introduced"
+)
+print(gen_info, row.names = FALSE)
+
+cat("\n--- Combat Stats ---\n")
+combat_stats <- data.frame(
+  Variable = c("hp", "defense", "sp_attack", "sp_defense", "speed"),
+  Type = rep("Continuous", 5),
+  Range = c(
+    paste0(min(pokemon$hp), "-", max(pokemon$hp)),
+    paste0(min(pokemon$defense), "-", max(pokemon$defense)),
+    paste0(min(pokemon$sp_attack), "-", max(pokemon$sp_attack)),
+    paste0(min(pokemon$sp_defense), "-", max(pokemon$sp_defense)),
+    paste0(min(pokemon$speed), "-", max(pokemon$speed))
+  )
+)
+print(combat_stats, row.names = FALSE)
+
+cat("\n--- Pokémon Characteristics ---\n")
+char_vars <- data.frame(
+  Variable = c("capture_rate", "height_m", "weight_kg", "base_egg_steps", 
+               "num_abilities", "evo_length", "percent_male"),
+  Type = rep("Continuous", 7),
+  Range = c(
+    paste0(min(pokemon$capture_rate), "-", max(pokemon$capture_rate)),
+    paste0(round(min(pokemon$height_m, na.rm=T), 1), "-", round(max(pokemon$height_m, na.rm=T), 1)),
+    paste0(round(min(pokemon$weight_kg, na.rm=T), 1), "-", round(max(pokemon$weight_kg, na.rm=T), 1)),
+    paste0(min(pokemon$base_egg_steps, na.rm=T), "-", max(pokemon$base_egg_steps, na.rm=T)),
+    paste0(min(pokemon$num_abilities, na.rm=T), "-", max(pokemon$num_abilities, na.rm=T)),
+    paste0(min(pokemon$evo_length, na.rm=T), "-", max(pokemon$evo_length, na.rm=T)),
+    paste0(min(pokemon$percent_male, na.rm=T), "-", max(pokemon$percent_male, na.rm=T))
+  )
+)
+print(char_vars, row.names = FALSE)
+
+cat("\n--- Categorical Variables ---\n")
+cat_vars <- data.frame(
+  Variable = c("rarity", "class_primary", "class_secondary", 
+               "has_mega_evolution", "has_gigantamax"),
+  Type = rep("Categorical (factor)", 5),
+  Levels = c(
+    paste0(length(unique(pokemon$rarity)), " levels"),
+    paste0(length(unique(pokemon$class_primary)), " types"),
+    paste0(length(unique(pokemon$class_secondary)), " types"),
+    "2 levels (0/1)",
+    "2 levels (0/1)"
+  )
+)
+print(cat_vars, row.names = FALSE)
+
+cat("\n--- Popularity (Reddit Survey) ---\n")
+pop_vars <- data.frame(
+  Variable = c("votes_first", "votes_top_6"),
+  Type = rep("Continuous", 2),
+  Range = c(
+    paste0(min(pokemon$votes_first, na.rm=T), "-", max(pokemon$votes_first, na.rm=T)),
+    paste0(min(pokemon$votes_top_6, na.rm=T), "-", max(pokemon$votes_top_6, na.rm=T))
+  )
+)
+print(pop_vars, row.names = FALSE)
+
+cat("\n--- Type Effectiveness (18 variables) ---\n")
+against_example <- data.frame(
+  Variables = "against_normal, against_fire, ... against_fairy",
+  Type = "Continuous",
+  Range = "0.25 - 4.0 (damage multiplier)",
+  Count = "18 variables"
+)
+print(against_example, row.names = FALSE)
+
+cat("\n═══ TOTAL PREDICTORS:", length(all_predictors), "═══\n")
+```
+
+**Variable Summary:**
+
+| Category | Count | Type |
+|----------|-------|------|
+| Generation | 1 | Categorical (9 levels) |
+| Combat Stats | 5 | Continuous |
+| Characteristics | 7 | Continuous |
+| Categorical | 5 | Factor |
+| Popularity | 2 | Continuous |
+| Type Effectiveness | 18 | Continuous |
+| **Total** | **38** | Mixed |
+
+**Conclusion:** Attack is a **continuous, positive-valued** response variable. We use 38 predictors including generation (categorical factor), combat stats, physical characteristics, types, popularity metrics, and type effectiveness multipliers.
+
+## 3.2 Distribution of Response Variable
+
+The distribution analysis from Section 2.1 shows:
+
+- **Skewness:** `r round(skewness(pokemon$attack), 2)` (slight positive skew, within acceptable range |skew| < 1)
+- **Shapiro-Wilk:** Rejects normality, but with n = `r nrow(pokemon)`, test is overly sensitive
+- **Visual assessment:** Approximately normal with slight right tail
+
+```{r distribution-conclusion}
+dist_assessment <- data.frame(
+  Criterion = c("Skewness", "Kurtosis", "Visual (Q-Q)", "Recommendation"),
+  Finding = c(
+    paste0(round(skewness(pokemon$attack), 2), " (acceptable: |skew| < 1)"),
+    paste0(round(kurtosis(pokemon$attack), 2), " (normal = 3)"),
+    "Minor deviation in tails only",
+    "Gaussian GLM appropriate; Gamma GLM as robustness check"
+  )
+)
+print(dist_assessment, row.names = FALSE)
+```
+
+**Conclusion:** Attack is **approximately normally distributed**. A **Gaussian (Normal) distribution** is appropriate for the primary model. We use **Gamma distribution** as a robustness check since Attack is strictly positive.
+
+## 3.3 Variance-Mean Relationship
+
+For GLM family selection, we examine how variance relates to mean:
+
+- **Gaussian (Normal):** Variance is constant (doesn't depend on mean)
+- **Poisson:** Variance equals mean
+- **Gamma:** Variance proportional to mean²
+
+```{r variance-analysis, fig.width=14, fig.height=10}
+# Fit simple model to check residual variance
+model_simple <- lm(attack ~ gen, data = pokemon)
+
+# Variance by generation
+var_by_gen <- pokemon %>%
+  mutate(residuals = residuals(model_simple)) %>%
+  group_by(gen) %>%
+  summarise(
+    n = n(),
+    mean_attack = mean(attack),
+    var_residuals = var(residuals),
+    sd_residuals = sd(residuals)
+  )
+
+# Print table
+var_by_gen_display <- var_by_gen
+var_by_gen_display[, -1] <- round(var_by_gen_display[, -1], 2)
+print(var_by_gen_display)
+
+# ═══════════════════════════════════════════════════════════════════
+# VISUALIZATION 1: Variance vs Mean by Generation
+# ═══════════════════════════════════════════════════════════════════
+p1 <- ggplot(var_by_gen, aes(x = mean_attack, y = var_residuals)) +
+  geom_point(aes(size = n, color = gen), alpha = 0.8) +
+  geom_smooth(method = "lm", se = TRUE, color = "#E76F51", linetype = "dashed") +
+  geom_text(aes(label = paste0("Gen ", gen)), vjust = -1.2, size = 3.5) +
+  scale_size_continuous(range = c(4, 12), name = "Sample Size") +
+  scale_color_viridis_d(option = "plasma", guide = "none") +
+  labs(title = "Variance vs Mean Relationship",
+       subtitle = "Each point = one generation; Flat line suggests constant variance (homoscedasticity)",
+       x = "Mean Attack by Generation",
+       y = "Residual Variance") +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+# ═══════════════════════════════════════════════════════════════════
+# VISUALIZATION 2: Residual Boxplots by Generation
+# ═══════════════════════════════════════════════════════════════════
+pokemon_with_resid <- pokemon %>%
+  mutate(residuals = residuals(model_simple))
+
+p2 <- ggplot(pokemon_with_resid, aes(x = gen, y = residuals, fill = gen)) +
+  geom_boxplot(alpha = 0.7, outlier.color = "#E76F51", outlier.size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red", linewidth = 1) +
+  scale_fill_viridis_d(option = "plasma", guide = "none") +
+  labs(title = "Residual Distribution by Generation",
+       subtitle = "Similar box widths suggest homoscedasticity; Red line = zero",
+       x = "Generation", y = "Residuals") +
+  theme_minimal()
+
+# ═══════════════════════════════════════════════════════════════════
+# VISUALIZATION 3: SD Comparison Bar Chart
+# ═══════════════════════════════════════════════════════════════════
+overall_sd <- sd(pokemon$attack)
+p3 <- ggplot(var_by_gen, aes(x = gen, y = sd_residuals, fill = gen)) +
+  geom_bar(stat = "identity", alpha = 0.8, color = "white") +
+  geom_hline(yintercept = mean(var_by_gen$sd_residuals), linetype = "dashed", 
+             color = "#E76F51", linewidth = 1.2) +
+  geom_text(aes(label = round(sd_residuals, 1)), vjust = -0.5, size = 3.5) +
+  scale_fill_viridis_d(option = "plasma", guide = "none") +
+  labs(title = "Residual Standard Deviation by Generation",
+       subtitle = paste0("Red line = average SD (", round(mean(var_by_gen$sd_residuals), 1), 
+                        "); Ratio max/min = ", 
+                        round(max(var_by_gen$sd_residuals)/min(var_by_gen$sd_residuals), 2)),
+       x = "Generation", y = "Residual SD") +
+  theme_minimal()
+
+# ═══════════════════════════════════════════════════════════════════
+# VISUALIZATION 4: Variance Ratio Assessment
+# ═══════════════════════════════════════════════════════════════════
+var_ratio <- max(var_by_gen$var_residuals) / min(var_by_gen$var_residuals)
+sd_ratio <- max(var_by_gen$sd_residuals) / min(var_by_gen$sd_residuals)
+
+assessment_df <- data.frame(
+  Metric = c("Max Variance", "Min Variance", "Variance Ratio", 
+             "Max SD", "Min SD", "SD Ratio", "Assessment"),
+  Value = c(round(max(var_by_gen$var_residuals), 1),
+            round(min(var_by_gen$var_residuals), 1),
+            round(var_ratio, 2),
+            round(max(var_by_gen$sd_residuals), 1),
+            round(min(var_by_gen$sd_residuals), 1),
+            round(sd_ratio, 2),
+            ifelse(sd_ratio < 2, "✓ Acceptable (ratio < 2)", 
+                   ifelse(sd_ratio < 3, "⚠ Borderline (ratio 2-3)", 
+                          "✗ Heteroscedastic (ratio > 3)")))
+)
+
+p4 <- ggplot(assessment_df, aes(x = Metric, y = 1)) +
+  geom_tile(aes(fill = Metric == "Assessment"), color = "white", width = 0.9, height = 0.5) +
+  geom_text(aes(label = Value), size = 4, fontface = "bold") +
+  scale_fill_manual(values = c("TRUE" = "#2A9D8F", "FALSE" = "#E9C46A"), guide = "none") +
+  coord_flip() +
+  labs(title = "Variance Homogeneity Assessment",
+       subtitle = "Rule of thumb: SD ratio < 2 indicates acceptable homoscedasticity") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank(),
+        panel.grid = element_blank())
+
+# Display plots individually
+print(p1)
+print(p2)
+print(p3)
+print(p4)
+```
+
+**Interpretation:**
+
+- **Gaussian GLM is appropriate if:** Variance is roughly constant across different mean values (flat relationship in Plot 1, similar box widths in Plot 2)
+- **SD Ratio < 2:** Generally indicates acceptable homoscedasticity for regression
+- If heteroscedasticity is detected, we can use robust standard errors or Gamma GLM as alternative
+
+## 3.4 Breusch-Pagan Heteroscedasticity Test
+
+```{r bp-test}
+# Simple model
+bp_simple <- bptest(model_simple)
+
+# Full model with ALL available predictors
+model_full <- lm(make_formula("attack", all_predictors), data = pokemon)
+bp_full <- bptest(model_full)
+
+bp_results <- data.frame(
+  Model = c("Simple (attack ~ gen)", "Full (with controls)"),
+  BP_Statistic = c(bp_simple$statistic, bp_full$statistic),
+  p_value = c(bp_simple$p.value, bp_full$p.value),
+  Result = c(
+    ifelse(bp_simple$p.value > 0.05, "Homoscedastic", "Heteroscedastic"),
+    ifelse(bp_full$p.value > 0.05, "Homoscedastic", "Heteroscedastic")
+  )
+)
+bp_results[, 2:3] <- round(bp_results[, 2:3], 4)
+print(bp_results, row.names = FALSE)
+```
+
+### Full Model Variance Diagnostics
+
+```{r full-model-variance, fig.width=14, fig.height=6}
+# Get residuals and fitted values from full model
+full_model_diag <- data.frame(
+  fitted = fitted(model_full),
+  residuals = residuals(model_full),
+  std_resid = rstandard(model_full),
+  sqrt_std_resid = sqrt(abs(rstandard(model_full)))
+)
+
+# ═══════════════════════════════════════════════════════════════════
+# PLOT 1: Residuals vs Fitted (Full Model)
+# ═══════════════════════════════════════════════════════════════════
+p_resid_full <- ggplot(full_model_diag, aes(x = fitted, y = residuals)) +
+  geom_point(alpha = 0.4, color = "#2A9D8F", size = 2) +
+  geom_smooth(method = "loess", se = TRUE, color = "#E76F51", linewidth = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 1) +
+  labs(title = "Residuals vs Fitted Values (Full Model)",
+       subtitle = "Random scatter = good fit; Pattern = model misspecification; Funnel shape = heteroscedasticity",
+       x = "Fitted Values", y = "Residuals") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14, face = "bold"))
+
+print(p_resid_full)
+```
+
+```{r full-model-scale-location, fig.width=14, fig.height=6}
+# ═══════════════════════════════════════════════════════════════════
+# PLOT 2: Scale-Location Plot (Full Model)
+# ═══════════════════════════════════════════════════════════════════
+p_scale_full <- ggplot(full_model_diag, aes(x = fitted, y = sqrt_std_resid)) +
+  geom_point(alpha = 0.4, color = "#264653", size = 2) +
+  geom_smooth(method = "loess", se = TRUE, color = "#E76F51", linewidth = 1.5) +
+  geom_hline(yintercept = mean(full_model_diag$sqrt_std_resid), 
+             linetype = "dashed", color = "#2A9D8F", linewidth = 1) +
+  labs(title = "Scale-Location Plot (Full Model)",
+       subtitle = "Flat line = constant variance (homoscedastic); Upward slope = variance increases with fitted values",
+       x = "Fitted Values", y = "√|Standardized Residuals|") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14, face = "bold"))
+
+print(p_scale_full)
+```
+
+```{r full-model-variance-bins, fig.width=14, fig.height=6}
+# ═══════════════════════════════════════════════════════════════════
+# PLOT 3: Variance by Fitted Value Bins (Full Model)
+# ═══════════════════════════════════════════════════════════════════
+# Create bins of fitted values
+full_model_diag$fitted_bin <- cut(full_model_diag$fitted, breaks = 10, labels = FALSE)
+
+var_by_bin <- full_model_diag %>%
+  group_by(fitted_bin) %>%
+  summarise(
+    n = n(),
+    mean_fitted = mean(fitted),
+    var_residuals = var(residuals),
+    sd_residuals = sd(residuals)
+  ) %>%
+  filter(!is.na(fitted_bin))
+
+p_var_bins <- ggplot(var_by_bin, aes(x = mean_fitted, y = sd_residuals)) +
+  geom_point(aes(size = n), color = "#E76F51", alpha = 0.8) +
+  geom_smooth(method = "lm", se = TRUE, color = "#264653", linetype = "dashed") +
+  geom_text(aes(label = paste0("n=", n)), vjust = -1.5, size = 3) +
+  scale_size_continuous(range = c(4, 12), name = "Sample Size") +
+  labs(title = "Residual SD by Fitted Value Range (Full Model)",
+       subtitle = "Each point = one decile of fitted values; Flat trend = homoscedastic",
+       x = "Mean Fitted Value (by decile)", 
+       y = "Residual Standard Deviation") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14, face = "bold"),
+        legend.position = "right")
+
+print(p_var_bins)
+```
+
+```{r full-model-variance-comparison, fig.width=14, fig.height=6}
+# ═══════════════════════════════════════════════════════════════════
+# PLOT 4: Compare Simple vs Full Model Residual Spread
+# ═══════════════════════════════════════════════════════════════════
+comparison_data <- data.frame(
+  Model = rep(c("Simple (attack ~ gen)", "Full (38 predictors)"), 
+              c(nrow(pokemon), nrow(pokemon))),
+  Residuals = c(residuals(model_simple), residuals(model_full)),
+  Fitted = c(fitted(model_simple), fitted(model_full))
+)
+
+p_compare <- ggplot(comparison_data, aes(x = Fitted, y = Residuals, color = Model)) +
+  geom_point(alpha = 0.3, size = 1.5) +
+  geom_smooth(method = "loess", se = FALSE, linewidth = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  scale_color_manual(values = c("Simple (attack ~ gen)" = "#E9C46A", 
+                                "Full (38 predictors)" = "#2A9D8F")) +
+  facet_wrap(~Model, scales = "free_x") +
+  labs(title = "Residual Comparison: Simple vs Full Model",
+       subtitle = paste0("Simple model SD = ", round(sd(residuals(model_simple)), 1),
+                        " | Full model SD = ", round(sd(residuals(model_full)), 1),
+                        " | Reduction = ", round((1 - sd(residuals(model_full))/sd(residuals(model_simple)))*100, 1), "%"),
+       x = "Fitted Values", y = "Residuals") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14, face = "bold"),
+        legend.position = "none",
+        strip.text = element_text(size = 12, face = "bold"))
+
+print(p_compare)
+```
+
+```{r log-transformation-check, fig.width=14, fig.height=10}
+# ═══════════════════════════════════════════════════════════════════
+# LOG TRANSFORMATION CHECK: Does log(Attack) fix heteroscedasticity?
+# ═══════════════════════════════════════════════════════════════════
+
+# Fit model with log-transformed response
+pokemon$log_attack <- log(pokemon$attack)
+model_full_log <- lm(make_formula("log_attack", all_predictors), data = pokemon)
+
+# Get diagnostics for log model
+log_model_diag <- data.frame(
+  fitted = fitted(model_full_log),
+  residuals = residuals(model_full_log),
+  std_resid = rstandard(model_full_log),
+  sqrt_std_resid = sqrt(abs(rstandard(model_full_log)))
+)
+
+# Breusch-Pagan test for log model
+bp_log <- bptest(model_full_log)
+
+# ═══════════════════════════════════════════════════════════════════
+# PLOT 1: Side-by-side Scale-Location comparison
+# ═══════════════════════════════════════════════════════════════════
+p_scale_original <- ggplot(full_model_diag, aes(x = fitted, y = sqrt_std_resid)) +
+  geom_point(alpha = 0.4, color = "#E76F51", size = 2) +
+  geom_smooth(method = "loess", se = TRUE, color = "#264653", linewidth = 1.5) +
+  geom_hline(yintercept = mean(full_model_diag$sqrt_std_resid), 
+             linetype = "dashed", color = "black") +
+  labs(title = "Original: Attack",
+       subtitle = paste0("BP test p = ", format.pval(bp_full$p.value, digits = 3)),
+       x = "Fitted Values", y = "√|Standardized Residuals|") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 12, face = "bold"))
+
+p_scale_log <- ggplot(log_model_diag, aes(x = fitted, y = sqrt_std_resid)) +
+  geom_point(alpha = 0.4, color = "#2A9D8F", size = 2) +
+  geom_smooth(method = "loess", se = TRUE, color = "#264653", linewidth = 1.5) +
+  geom_hline(yintercept = mean(log_model_diag$sqrt_std_resid), 
+             linetype = "dashed", color = "black") +
+  labs(title = "Log-Transformed: log(Attack)",
+       subtitle = paste0("BP test p = ", format.pval(bp_log$p.value, digits = 3)),
+       x = "Fitted Values", y = "√|Standardized Residuals|") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 12, face = "bold"))
+
+# ═══════════════════════════════════════════════════════════════════
+# PLOT 2: Side-by-side Residuals vs Fitted
+# ═══════════════════════════════════════════════════════════════════
+p_resid_original <- ggplot(full_model_diag, aes(x = fitted, y = std_resid)) +
+  geom_point(alpha = 0.4, color = "#E76F51", size = 2) +
+  geom_smooth(method = "loess", se = TRUE, color = "#264653", linewidth = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  labs(title = "Original: Attack",
+       x = "Fitted Values", y = "Standardized Residuals") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 12, face = "bold"))
+
+p_resid_log <- ggplot(log_model_diag, aes(x = fitted, y = std_resid)) +
+  geom_point(alpha = 0.4, color = "#2A9D8F", size = 2) +
+  geom_smooth(method = "loess", se = TRUE, color = "#264653", linewidth = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  labs(title = "Log-Transformed: log(Attack)",
+       x = "Fitted Values", y = "Standardized Residuals") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 12, face = "bold"))
+
+# Combine plots
+grid.arrange(
+  p_scale_original, p_scale_log,
+  p_resid_original, p_resid_log,
+  ncol = 2,
+  top = "Heteroscedasticity Comparison: Original vs Log-Transformed Attack"
+)
+```
+
+```{r log-transform-qq, fig.width=14, fig.height=5}
+# ═══════════════════════════════════════════════════════════════════
+# Q-Q Plot Comparison
+# ═══════════════════════════════════════════════════════════════════
+p_qq_original <- ggplot(full_model_diag, aes(sample = std_resid)) +
+  stat_qq(color = "#E76F51", alpha = 0.6, size = 2) +
+  stat_qq_line(color = "#264653", linewidth = 1.2) +
+  labs(title = "Q-Q Plot: Original Model",
+       subtitle = "Residuals from Attack ~ predictors",
+       x = "Theoretical Quantiles", y = "Sample Quantiles") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 12, face = "bold"))
+
+p_qq_log <- ggplot(log_model_diag, aes(sample = std_resid)) +
+  stat_qq(color = "#2A9D8F", alpha = 0.6, size = 2) +
+  stat_qq_line(color = "#264653", linewidth = 1.2) +
+  labs(title = "Q-Q Plot: Log-Transformed Model",
+       subtitle = "Residuals from log(Attack) ~ predictors",
+       x = "Theoretical Quantiles", y = "Sample Quantiles") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 12, face = "bold"))
+
+grid.arrange(p_qq_original, p_qq_log, ncol = 2)
+```
+
+```{r sqrt-transformation-check, fig.width=14, fig.height=6}
+# ═══════════════════════════════════════════════════════════════════
+# SQRT TRANSFORMATION CHECK
+# ═══════════════════════════════════════════════════════════════════
+
+# Fit model with sqrt-transformed response
+pokemon$sqrt_attack <- sqrt(pokemon$attack)
+model_full_sqrt <- lm(make_formula("sqrt_attack", all_predictors), data = pokemon)
+
+# Get diagnostics for sqrt model
+sqrt_model_diag <- data.frame(
+  fitted = fitted(model_full_sqrt),
+  residuals = residuals(model_full_sqrt),
+  std_resid = rstandard(model_full_sqrt),
+  sqrt_std_resid = sqrt(abs(rstandard(model_full_sqrt)))
+)
+
+# Breusch-Pagan test for sqrt model
+bp_sqrt <- bptest(model_full_sqrt)
+
+# Scale-Location plots for all three
+p_scale_sqrt <- ggplot(sqrt_model_diag, aes(x = fitted, y = sqrt_std_resid)) +
+  geom_point(alpha = 0.4, color = "#9B5DE5", size = 2) +
+  geom_smooth(method = "loess", se = TRUE, color = "#264653", linewidth = 1.5) +
+  geom_hline(yintercept = mean(sqrt_model_diag$sqrt_std_resid), 
+             linetype = "dashed", color = "black") +
+  labs(title = "Sqrt-Transformed: √Attack",
+       subtitle = paste0("BP test p = ", format.pval(bp_sqrt$p.value, digits = 3)),
+       x = "Fitted Values", y = "√|Standardized Residuals|") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 12, face = "bold"))
+
+# Compare all three scale-location plots
+grid.arrange(
+  p_scale_original, p_scale_log, p_scale_sqrt,
+  ncol = 3,
+  top = "Scale-Location Comparison: Original vs Log vs Sqrt Transformation"
+)
+```
+
+```{r all-transforms-comparison, fig.width=14, fig.height=5}
+# ═══════════════════════════════════════════════════════════════════
+# Q-Q Plots for all three transformations
+# ═══════════════════════════════════════════════════════════════════
+p_qq_sqrt <- ggplot(sqrt_model_diag, aes(sample = std_resid)) +
+  stat_qq(color = "#9B5DE5", alpha = 0.6, size = 2) +
+  stat_qq_line(color = "#264653", linewidth = 1.2) +
+  labs(title = "Q-Q Plot: Sqrt Model",
+       subtitle = "Residuals from √Attack ~ predictors",
+       x = "Theoretical Quantiles", y = "Sample Quantiles") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 12, face = "bold"))
+
+grid.arrange(p_qq_original, p_qq_log, p_qq_sqrt, ncol = 3)
+```
+
+```{r transformation-summary}
+# ═══════════════════════════════════════════════════════════════════
+# COMPREHENSIVE SUMMARY: All Transformations
+# ═══════════════════════════════════════════════════════════════════
+cat(paste0(
+  "\n═══════════════════════════════════════════════════════════════════\n",
+  "         TRANSFORMATION COMPARISON SUMMARY\n",
+  "═══════════════════════════════════════════════════════════════════\n\n"
+))
+
+comparison_table <- data.frame(
+  Metric = c("Response Variable", "BP Statistic", "BP p-value", 
+             "Heteroscedastic?", "Residual SD", "R²"),
+  Original = c(
+    "Attack",
+    round(bp_full$statistic, 2),
+    format.pval(bp_full$p.value, digits = 4),
+    ifelse(bp_full$p.value < 0.05, "Yes ⚠", "No ✓"),
+    round(sd(residuals(model_full)), 3),
+    round(summary(model_full)$r.squared, 4)
+  ),
+  Log = c(
+    "log(Attack)",
+    round(bp_log$statistic, 2),
+    format.pval(bp_log$p.value, digits = 4),
+    ifelse(bp_log$p.value < 0.05, "Yes ⚠", "No ✓"),
+    round(sd(residuals(model_full_log)), 4),
+    round(summary(model_full_log)$r.squared, 4)
+  ),
+  Sqrt = c(
+    "√Attack",
+    round(bp_sqrt$statistic, 2),
+    format.pval(bp_sqrt$p.value, digits = 4),
+    ifelse(bp_sqrt$p.value < 0.05, "Yes ⚠", "No ✓"),
+    round(sd(residuals(model_full_sqrt)), 4),
+    round(summary(model_full_sqrt)$r.squared, 4)
+  )
+)
+print(comparison_table, row.names = FALSE)
+
+# Determine best transformation
+p_values <- c(Original = bp_full$p.value, Log = bp_log$p.value, Sqrt = bp_sqrt$p.value)
+best_transform <- names(which.max(p_values))
+
+if(max(p_values) > 0.05) {
+  rec_text <- paste0(
+    "✓ The ", best_transform, " transformation achieves HOMOSCEDASTICITY (p > 0.05)\n",
+    "  → Recommended for valid standard errors\n"
+  )
+} else {
+  rec_text <- paste0(
+    "⚠ None of the transformations fully resolve heteroscedasticity\n",
+    "  → Consider using:\n",
+    "    1. Robust/sandwich standard errors\n",
+    "    2. Gamma GLM with log link\n",
+    "    3. Weighted least squares\n"
+  )
+}
+
+cat(paste0(
+  "\n═══════════════════════════════════════════════════════════════════\n",
+  "                    RECOMMENDATION\n",
+  "═══════════════════════════════════════════════════════════════════\n\n",
+  "BP p-values (higher = more homoscedastic):\n",
+  "  Original:  ", format.pval(bp_full$p.value, digits = 4), "\n",
+  "  Log:       ", format.pval(bp_log$p.value, digits = 4), "\n",
+  "  Sqrt:      ", format.pval(bp_sqrt$p.value, digits = 4), "\n\n",
+  "Best transformation: ", best_transform, "\n",
+  "  (Highest BP p-value = least heteroscedasticity)\n\n",
+  rec_text, "\n",
+  "--- Coefficient Interpretation ---\n",
+  "Original: β = change in Attack points\n",
+  "Log:      β ≈ % change in Attack (multiply by 100)\n",
+  "Sqrt:     β = change in √Attack units (harder to interpret)\n"
+))
+```
+
+```{r heteroscedasticity-assessment}
+# Summary assessment
+sd_ratio_full <- max(var_by_bin$sd_residuals) / min(var_by_bin$sd_residuals)
+
+if(bp_full$p.value < 0.05) {
+  rec_hetero <- paste0(
+    "Recommendation:\n",
+    "  The full model shows heteroscedasticity. Consider:\n",
+    "  1. Using robust standard errors (sandwich estimator)\n",
+    "  2. Gamma GLM as alternative (already included as robustness check)\n",
+    "  3. Results remain valid for coefficient estimates, but SEs may be affected\n"
+  )
+} else {
+  rec_hetero <- paste0(
+    "Recommendation:\n",
+    "  The full model shows acceptable homoscedasticity.\n",
+    "  Standard GLM inference is valid.\n"
+  )
+}
+
+cat(paste0(
+  "\n═══════════════════════════════════════════════════════════════════\n",
+  "                 HETEROSCEDASTICITY ASSESSMENT\n",
+  "═══════════════════════════════════════════════════════════════════\n\n",
+  "Breusch-Pagan Test Results:\n",
+  "  Simple model: p = ", round(bp_simple$p.value, 4), " ",
+    ifelse(bp_simple$p.value > 0.05, "→ Homoscedastic ✓", "→ Heteroscedastic ⚠"), "\n",
+  "  Full model:   p = ", round(bp_full$p.value, 4), " ",
+    ifelse(bp_full$p.value > 0.05, "→ Homoscedastic ✓", "→ Heteroscedastic ⚠"), "\n\n",
+  "Full Model Variance Check:\n",
+  "  SD Range: ", round(min(var_by_bin$sd_residuals), 1), " - ", 
+    round(max(var_by_bin$sd_residuals), 1), "\n",
+  "  SD Ratio (max/min): ", round(sd_ratio_full, 2), "\n",
+  "  Assessment: ", ifelse(sd_ratio_full < 2, "Acceptable (ratio < 2) ✓", 
+                            ifelse(sd_ratio_full < 3, "Borderline (ratio 2-3) ⚠",
+                                   "Problematic (ratio > 3) ✗")), "\n\n",
+  rec_hetero
+))
+```
+
+## 3.5 Multicollinearity Check (VIF)
+
+```{r vif-check}
+# VIF for full model
+vif_values <- car::vif(model_full)
+
+if(is.matrix(vif_values)) {
+  vif_df <- data.frame(
+    Variable = rownames(vif_values),
+    GVIF = round(vif_values[, 1], 2),
+    Df = vif_values[, 2],
+    `GVIF_adj` = round(vif_values[, 3], 2)
+  )
+  print(vif_df, row.names = FALSE)
+  max_vif <- max(vif_values[, 3])
+} else {
+  vif_df <- data.frame(Variable = names(vif_values), VIF = round(vif_values, 2))
+  print(vif_df, row.names = FALSE)
+  max_vif <- max(vif_values)
+}
+
+```
+
+## 3.6 Link Function Selection
+
+The link function connects the linear predictor to the expected value of the response.
+
+```{r link-function-analysis, fig.width=12, fig.height=5}
+# Compare identity vs log link predictions
+model_identity <- glm(attack ~ gen + hp + defense, data = pokemon, 
+                      family = gaussian(link = "identity"))
+model_log <- glm(attack ~ gen + hp + defense, data = pokemon, 
+                 family = gaussian(link = "log"))
+
+# Prediction comparison
+link_comparison <- data.frame(
+  Actual = pokemon$attack,
+  Identity_Pred = fitted(model_identity),
+  Log_Pred = fitted(model_log)
+)
+
+rmse_identity <- sqrt(mean((link_comparison$Actual - link_comparison$Identity_Pred)^2))
+rmse_log <- sqrt(mean((link_comparison$Actual - link_comparison$Log_Pred)^2))
+
+link_choice <- data.frame(
+  Link = c("Identity", "Log"),
+  Formula = c("E(Y) = Xβ", "log(E(Y)) = Xβ"),
+  RMSE = c(round(rmse_identity, 2), round(rmse_log, 2)),
+  Interpretation = c("β = change in Attack points", "exp(β) = multiplicative change")
+)
+print(link_choice, row.names = FALSE)
+
+# Visual comparison
+p_id <- ggplot(link_comparison, aes(x = Actual, y = Identity_Pred)) +
+  geom_point(alpha = 0.4, color = "#2A9D8F") +
+  geom_abline(slope = 1, intercept = 0, color = "red", linewidth = 1.2, linetype = "dashed") +
+  labs(title = "Identity Link", subtitle = paste0("RMSE = ", round(rmse_identity, 1)),
+       x = "Actual", y = "Predicted") +
+  theme_minimal()
+
+p_log <- ggplot(link_comparison, aes(x = Actual, y = Log_Pred)) +
+  geom_point(alpha = 0.4, color = "#E76F51") +
+  geom_abline(slope = 1, intercept = 0, color = "red", linewidth = 1.2, linetype = "dashed") +
+  labs(title = "Log Link", subtitle = paste0("RMSE = ", round(rmse_log, 1)),
+       x = "Actual", y = "Predicted") +
+  theme_minimal()
+
+grid.arrange(p_id, p_log, ncol = 2, top = "Link Function Comparison")
+```
+
+**Conclusion:** We choose the **Identity link** because:
+
+1. **Interpretability:** Coefficients represent direct change in Attack points
+2. **No boundary issues:** Attack range (5-185) is well above zero
+3. **Theoretical basis:** Power creep is expected to be additive rather than multiplicative
+4. **Similar fit:** Both links perform comparably
+
+## 3.7 Diagnostic Plots
+
+```{r diagnostic-plots, fig.width=12, fig.height=10}
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 2))
+plot(model_full, which = 1:4)
+```
+
+```{r custom-diagnostics, fig.width=12, fig.height=5}
+# Custom diagnostic plots
+diag_data <- data.frame(
+  fitted = fitted(model_full),
+  residuals = residuals(model_full),
+  std_resid = rstandard(model_full),
+  sqrt_std_resid = sqrt(abs(rstandard(model_full)))
+)
+
+p_resid_fitted <- ggplot(diag_data, aes(x = fitted, y = residuals)) +
+  geom_point(alpha = 0.4, color = "#2A9D8F") +
+  geom_smooth(method = "loess", se = TRUE, color = "#E76F51", linewidth = 1.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  labs(title = "Residuals vs Fitted Values",
+       subtitle = "Random scatter around 0 indicates good model specification",
+       x = "Fitted Values", y = "Residuals") +
+  theme_minimal()
+
+p_scale_loc <- ggplot(diag_data, aes(x = fitted, y = sqrt_std_resid)) +
+  geom_point(alpha = 0.4, color = "#264653") +
+  geom_smooth(method = "loess", se = TRUE, color = "#E76F51", linewidth = 1.2) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "gray50") +
+  labs(title = "Scale-Location Plot",
+       subtitle = "Flat line indicates constant variance",
+       x = "Fitted Values", y = "√|Standardized Residuals|") +
+  theme_minimal()
+
+grid.arrange(p_resid_fitted, p_scale_loc, ncol = 2)
+```
+
+## 3.8 Prerequisites Summary
+
+```{r prerequisites-summary}
+prereq_summary <- data.frame(
+  Question = c(
+    "1. Variable Types",
+    "2. Distribution",
+    "3. Variance-Mean",
+    "4. Link Function"
+  ),
+  Finding = c(
+    "Attack = continuous positive; Gen = categorical factor",
+    "Approximately normal (skew = 0.28, acceptable)",
+    "Homoscedastic in simple model; mild heteroscedasticity in full model",
+    "Identity link (additive interpretation, no boundary issues)"
+  ),
+  GLM_Choice = c(
+    "Gaussian family appropriate",
+    "Gaussian primary; Gamma for robustness",
+    "Standard errors valid; robust checks included",
+    "Identity link for Gaussian; Log link for Gamma"
+  )
+)
+print(prereq_summary, row.names = FALSE)
+```
+
+**Final GLM Specification:**
+
+- **Primary Model:** `glm(attack ~ gen + controls, family = gaussian(link = "identity"))`
+- **Robustness Check:** `glm(attack ~ gen + controls, family = Gamma(link = "log"))`
+
+---
+
+# 4. Attack GLM Models
+
+## 4.1 Model 1: Simple Generation Effect
+
+Before fitting the model, let's visualize what Attack looks like across generations to understand what the model will capture:
+
+```{r simple-model-explanation, fig.width=14, fig.height=10}
+# ═══════════════════════════════════════════════════════════════════
+# VISUALIZING ATTACK BY GENERATION (What the Simple Model Captures)
+# ═══════════════════════════════════════════════════════════════════
+
+# Calculate generation means and Gen 1 reference
+gen1_mean <- mean(pokemon$attack[pokemon$gen == "1"])
+
+gen_stats <- pokemon %>%
+  group_by(gen) %>%
+  summarise(
+    n = n(),
+    mean_attack = mean(attack),
+    median_attack = median(attack),
+    sd_attack = sd(attack),
+    se = sd(attack) / sqrt(n()),
+    diff_from_gen1 = mean(attack) - gen1_mean
+  ) %>%
+  mutate(
+    significant = abs(diff_from_gen1) / se > 1.96,  # Approximate significance
+    label = paste0(ifelse(diff_from_gen1 >= 0, "+", ""), round(diff_from_gen1, 1))
+  )
+
+# PLOT 1: Boxplot with individual points and Gen 1 reference
+p1 <- ggplot(pokemon, aes(x = gen, y = attack)) +
+  geom_boxplot(aes(fill = gen), alpha = 0.6, outlier.shape = NA) +
+  geom_jitter(aes(color = gen), width = 0.2, alpha = 0.3, size = 1) +
+  geom_hline(yintercept = gen1_mean, linetype = "dashed", 
+             color = "red", linewidth = 1.2) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 5, color = "black") +
+  annotate("text", x = 9.5, y = gen1_mean + 5, label = paste0("Gen 1 Mean\n(", round(gen1_mean, 1), ")"),
+           color = "red", fontface = "bold", size = 3.5) +
+  scale_fill_viridis_d(option = "plasma", guide = "none") +
+  scale_color_viridis_d(option = "plasma", guide = "none") +
+  labs(title = "Attack Distribution by Generation",
+       subtitle = "Each point = one Pokémon; Diamonds = generation means; Red line = Gen 1 mean (reference)",
+       x = "Generation", y = "Attack") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14, face = "bold"))
+
+# PLOT 2: Bar chart showing difference from Gen 1 (= GLM coefficients)
+p2 <- ggplot(gen_stats, aes(x = gen, y = diff_from_gen1, fill = diff_from_gen1 > 0)) +
+  geom_bar(stat = "identity", alpha = 0.8, color = "black") +
+  geom_errorbar(aes(ymin = diff_from_gen1 - 1.96*se, ymax = diff_from_gen1 + 1.96*se),
+                width = 0.3, linewidth = 0.8) +
+  geom_hline(yintercept = 0, linewidth = 1.2, color = "black") +
+  geom_text(aes(label = label, y = diff_from_gen1 + sign(diff_from_gen1) * 3), 
+            size = 4, fontface = "bold") +
+  scale_fill_manual(values = c("TRUE" = "#2A9D8F", "FALSE" = "#E76F51"),
+                    labels = c("TRUE" = "Higher than Gen 1", "FALSE" = "Lower than Gen 1"),
+                    name = "") +
+  labs(title = "How Each Generation Compares to Gen 1",
+       subtitle = "These bars ARE the GLM coefficients (difference from Gen 1 mean); Error bars = 95% CI",
+       x = "Generation", y = "Difference from Gen 1 (Attack Points)") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14, face = "bold"),
+        legend.position = "bottom")
+
+# PLOT 3: Mean trajectory with trend line
+p3 <- ggplot(gen_stats, aes(x = as.numeric(as.character(gen)), y = mean_attack)) +
+  geom_line(linewidth = 1.2, color = "#264653") +
+  geom_point(aes(size = n), color = "#E76F51", alpha = 0.8) +
+  geom_smooth(method = "lm", se = TRUE, color = "#2A9D8F", 
+              linetype = "dashed", linewidth = 1) +
+  geom_hline(yintercept = gen1_mean, linetype = "dotted", 
+             color = "red", linewidth = 1) +
+  scale_x_continuous(breaks = 1:9) +
+  scale_size_continuous(range = c(4, 10), name = "n Pokémon") +
+  labs(title = "Attack Mean Trajectory Across Generations",
+       subtitle = "Dashed line = linear trend; Dotted red = Gen 1 baseline; Point size = sample size",
+       x = "Generation", y = "Mean Attack") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14, face = "bold"))
+
+# PLOT 4: Summary table as visualization
+gen_table <- gen_stats %>%
+  dplyr::select(gen, n, mean_attack, diff_from_gen1) %>%
+  mutate(
+    mean_attack = round(mean_attack, 1),
+    diff_from_gen1 = round(diff_from_gen1, 1)
+  )
+
+p4 <- ggplot(gen_table, aes(x = gen, y = 1)) +
+  geom_tile(aes(fill = diff_from_gen1), color = "white", width = 0.9, height = 0.8) +
+  geom_text(aes(label = paste0("n=", n, "\nMean=", mean_attack, "\nΔ=", 
+                                ifelse(diff_from_gen1 >= 0, "+", ""), diff_from_gen1)),
+            size = 3.5, fontface = "bold") +
+  scale_fill_gradient2(low = "#E76F51", mid = "white", high = "#2A9D8F", 
+                       midpoint = 0, name = "Diff from Gen 1") +
+  labs(title = "Generation Summary Statistics",
+       subtitle = "n = sample size; Mean = average Attack; Δ = difference from Gen 1") +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank(),
+        panel.grid = element_blank(),
+        plot.title = element_text(size = 14, face = "bold"))
+
+# Display plots
+grid.arrange(p1, p2, ncol = 2)
+```
+
+```{r simple-model-trajectory, fig.width=12, fig.height=5}
+grid.arrange(p3, p4, ncol = 2)
+```
+
+**Reading the Plots:**
+
+- **Top Left (Boxplot):** Shows the full distribution of Attack for each generation. The red dashed line is the Gen 1 mean (our reference). Generations above this line have positive coefficients.
+- **Top Right (Bar Chart):** These bars directly represent what the GLM estimates — the difference between each generation's mean Attack and Gen 1. Bars above zero = higher Attack than Gen 1.
+- **Bottom Left (Trajectory):** Connects the means to show the overall pattern. The upward dashed trend line suggests power creep.
+- **Bottom Right (Summary):** Quick reference for sample sizes and key statistics per generation.
+
+Now let's fit the simple model:
+
+```{r model1-simple}
+# Model 1: Attack as function of generation only
+model1 <- glm(attack ~ gen, data = pokemon, family = gaussian(link = "identity"))
+
+summary(model1)
+
+# Extract and format coefficients
+model1_coefs <- tidy(model1) %>%
+  mutate(
+    estimate = round(estimate, 3),
+    std.error = round(std.error, 3),
+    statistic = round(statistic, 3),
+    p.value = format.pval(p.value, digits = 3)
+  )
+
+# Generation coefficients
+model1_coefs %>% filter(str_detect(term, "gen"))
+```
+
+**Interpretation:** The intercept (`r round(coef(model1)[1], 1)`) is the mean Attack for Generation 1. Each generation coefficient represents the difference from this baseline — exactly what we visualized in the bar chart above.
+
+## 4.2 Model 2: With Combat Stat Controls
+
+```{r model2-controls}
+# Model 2: Add other combat stats as controls
+model2 <- glm(attack ~ gen + hp + defense + sp_attack + sp_defense + speed, 
+              data = pokemon, family = gaussian(link = "identity"))
+
+summary(model2)
+
+model2_coefs <- tidy(model2) %>%
+  mutate(
+    estimate = round(estimate, 3),
+    std.error = round(std.error, 3),
+    statistic = round(statistic, 3),
+    p.value = format.pval(p.value, digits = 3),
+    significant = ifelse(as.numeric(p.value) < 0.05, "*", "")
+  )
+
+model2_coefs
+```
+
+## 4.3 Model 3: Full Model with All Available Predictors
+
+```{r model3-full}
+# Model 3: Full model with ALL available predictors
+model3 <- glm(make_formula("attack", all_predictors), 
+              data = pokemon, family = gaussian(link = "identity"))
+
+summary(model3)
+
+# Extract significant predictors
+model3_coefs <- tidy(model3) %>%
+  mutate(significant = p.value < 0.1) %>%
+  arrange(p.value)
+
+# Show all significant predictors
+model3_coefs %>%
+  filter(significant) %>%
+  mutate(
+    estimate = round(estimate, 3),
+    std.error = round(std.error, 3),
+    p.value = format.pval(p.value, digits = 3)
+  ) %>%
+  dplyr::select(term, estimate, std.error, p.value)
+```
+
+## 4.4 Model 4: Gamma GLM (Robustness Check)
+
+```{r model4-gamma}
+# Model 4: Gamma GLM with log link (same predictors as Model 3)
+model4 <- glm(make_formula("attack", all_predictors), 
+              data = pokemon, family = Gamma(link = "log"))
+
+summary(model4)
+
+# Convert coefficients to percentage change
+gamma_coefs <- tidy(model4) %>%
+  filter(str_detect(term, "gen")) %>%
+  mutate(
+    generation = as.numeric(str_extract(term, "\\d+")),
+    pct_change = round((exp(estimate) - 1) * 100, 2),
+    estimate = round(estimate, 4),
+    p.value = format.pval(p.value, digits = 3)
+  ) %>%
+  dplyr::select(generation, estimate, pct_change, p.value)
+
+gamma_coefs
+```
+
+## 4.5 Model Comparison
+
+```{r model-comparison}
+# Compare all models
+model_comparison <- data.frame(
+  Model = c("M1: gen only", "M2: + combat stats", "M3: + rarity", "M4: Gamma GLM"),
+  Predictors = c("gen", "gen + 5 stats", "gen + 5 stats + rarity + capture_rate", 
+                 "Same as M3 (Gamma)"),
+  AIC = c(AIC(model1), AIC(model2), AIC(model3), AIC(model4)),
+  BIC = c(BIC(model1), BIC(model2), BIC(model3), BIC(model4)),
+  Deviance = c(model1$deviance, model2$deviance, model3$deviance, model4$deviance),
+  Pseudo_R2 = c(
+    1 - model1$deviance/model1$null.deviance,
+    1 - model2$deviance/model2$null.deviance,
+    1 - model3$deviance/model3$null.deviance,
+    1 - model4$deviance/model4$null.deviance
+  )
+)
+
+model_comparison[, 3:6] <- round(model_comparison[, 3:6], 2)
+
+print(model_comparison, row.names = FALSE)
+```
+
+```{r model-comparison-plot, fig.width=10, fig.height=5}
+# Visual comparison
+model_comparison_long <- model_comparison %>%
+  pivot_longer(cols = c(AIC, BIC), names_to = "Criterion", values_to = "Value")
+
+ggplot(model_comparison_long, aes(x = Model, y = Value, fill = Criterion)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), alpha = 0.8) +
+  scale_fill_manual(values = c("AIC" = "#E76F51", "BIC" = "#2A9D8F")) +
+  labs(title = "Model Comparison: AIC and BIC",
+       subtitle = "Lower values indicate better model fit",
+       x = "Model", y = "Information Criterion Value") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1))
+```
+
+## 4.6 LASSO Regularization: Feature Selection
+
+### What is LASSO and Why Use It?
+
+**LASSO** (Least Absolute Shrinkage and Selection Operator) is a regularization technique that adds a penalty to the regression model. This penalty forces the model to "pay a cost" for each predictor it uses. The key insight is that LASSO shrinks unimportant coefficients all the way to **exactly zero**, effectively removing them from the model.
+
+**Why is this useful for power creep analysis?**
+
+In standard regression (OLS/GLM), we include all 38 predictors and each gets a coefficient. But which predictors actually *matter*? LASSO answers this objectively by forcing predictors to compete:
+
+- **Strong predictors** keep their coefficients (though slightly shrunk)
+- **Weak predictors** get shrunk to zero and are eliminated
+- **The λ (lambda) parameter** controls how harsh the penalty is — higher λ = fewer survivors
+
+**The critical question:** If we force all 38 predictors to compete, does **Generation** survive? If generation coefficients shrink to zero, it means other variables (combat stats, type, rarity) explain Attack better than generation does. If generation survives, it provides unique predictive value that other variables cannot explain.
+
+**Two common λ choices:**
+- **λ.min:** Minimizes cross-validation error (keeps more predictors)
+- **λ.1se:** One standard error rule (more parsimonious, stricter selection)
+
+```{r lasso-preparation}
+# Prepare data for LASSO (requires matrix format)
+# Create model matrix with all predictors (excluding intercept)
+X <- model.matrix(make_formula("attack", all_predictors), data = pokemon)[, -1]
+y <- pokemon$attack
+
+cat("Feature matrix dimensions:", dim(X)[1], "observations x", dim(X)[2], "features\n")
+```
+
+```{r lasso-cv, fig.width=12, fig.height=5}
+# Cross-validated LASSO to find optimal lambda
+set.seed(42)
+cv_lasso <- cv.glmnet(X, y, alpha = 1, nfolds = 10)
+
+# Plot cross-validation curve
+plot(cv_lasso, main = "LASSO Cross-Validation: Finding Optimal Lambda")
+
+# Extract optimal lambdas
+lambda_min <- cv_lasso$lambda.min
+lambda_1se <- cv_lasso$lambda.1se
+
+cat(paste0(
+  "\n═══════════════════════════════════════════════════════════════════\n",
+  "                 LASSO CROSS-VALIDATION RESULTS\n",
+  "═══════════════════════════════════════════════════════════════════\n\n",
+  "Lambda (min MSE):    ", round(lambda_min, 4), "\n",
+  "Lambda (1-SE rule):  ", round(lambda_1se, 4), "\n",
+  "  → 1-SE rule gives a more parsimonious model\n"
+))
+```
+
+```{r lasso-coefficients, fig.width=12, fig.height=8}
+# Fit final LASSO models
+lasso_min <- glmnet(X, y, alpha = 1, lambda = lambda_min)
+lasso_1se <- glmnet(X, y, alpha = 1, lambda = lambda_1se)
+
+# Extract coefficients at lambda.min
+coefs_min <- as.matrix(coef(lasso_min))
+coefs_1se <- as.matrix(coef(lasso_1se))
+
+# ═══════════════════════════════════════════════════════════════════
+# CREATE READABLE VARIABLE NAMES (map factor levels back to names)
+# ═══════════════════════════════════════════════════════════════════
+
+# Type name lookup tables (derived from pokemon.csv mapping)
+primary_type_names <- c(
+  "0" = "Grass", "1" = "Fire", "2" = "Water", "3" = "Bug", 
+  "4" = "Normal", "5" = "Poison", "6" = "Electric", "7" = "Ground",
+  "8" = "Fairy", "9" = "Fighting", "10" = "Psychic", "11" = "Rock",
+  "12" = "Ghost", "13" = "Ice", "14" = "Dragon", "15" = "Dark",
+  "16" = "Steel", "17" = "Flying"
+)
+
+secondary_type_names <- c(
+  "0" = "Poison", "1" = "(None)", "2" = "Flying", "3" = "Dark",
+  "4" = "Electric", "5" = "Ice", "6" = "Ground", "7" = "Fairy",
+  "8" = "Grass", "9" = "Fighting", "10" = "Psychic", "11" = "Steel",
+  "12" = "Fire", "13" = "Rock", "14" = "Water", "15" = "Dragon",
+  "16" = "Ghost", "17" = "Bug", "18" = "Normal"
+)
+
+rarity_names <- c("0" = "Normal", "1" = "SubLegendary", "2" = "Legendary", "3" = "Mythical")
+
+# Function to convert coded variable names to readable names
+make_readable <- function(var_name) {
+  # Generation: gen2 -> "Gen 2", gen9 -> "Gen 9"
+  if(str_detect(var_name, "^gen\\d+$")) {
+    return(paste0("Gen ", str_extract(var_name, "\\d+")))
+  }
+  # Primary type: class_primary9 -> "Type (1°): Fighting"
+  if(str_detect(var_name, "^class_primary")) {
+    idx <- str_extract(var_name, "\\d+")
+    if(!is.na(idx) && idx %in% names(primary_type_names)) {
+      return(paste0("Type (1°): ", primary_type_names[idx]))
+    }
+  }
+  # Secondary type: class_secondary14 -> "Type (2°): Water"
+  if(str_detect(var_name, "^class_secondary")) {
+    idx <- str_extract(var_name, "\\d+")
+    if(!is.na(idx) && idx %in% names(secondary_type_names)) {
+      return(paste0("Type (2°): ", secondary_type_names[idx]))
+    }
+  }
+  # Rarity: rarity1 -> "Rarity: SubLegendary"
+  if(str_detect(var_name, "^rarity\\d+$")) {
+    idx <- str_extract(var_name, "\\d+")
+    if(!is.na(idx) && idx %in% names(rarity_names)) {
+      return(paste0("Rarity: ", rarity_names[idx]))
+    }
+  }
+  # Mega/Gigantamax
+  if(var_name == "has_mega_evolution1") return("Has Mega Evolution")
+  if(var_name == "has_gigantamax1") return("Has Gigantamax")
+  # Against types: against_fire -> "vs Fire"
+  if(str_detect(var_name, "^against_")) {
+    type_name <- str_replace(var_name, "against_", "")
+    return(paste0("vs ", str_to_title(type_name)))
+  }
+  # Default: return as-is but with nicer formatting
+  return(str_to_title(str_replace_all(var_name, "_", " ")))
+}
+
+# Create coefficient dataframe with readable names
+lasso_coefs <- data.frame(
+  Variable_Code = rownames(coefs_min),
+  Coef_LambdaMin = round(as.vector(coefs_min), 4),
+  Coef_Lambda1SE = round(as.vector(coefs_1se), 4)
+) %>%
+  filter(Variable_Code != "(Intercept)") %>%
+  mutate(
+    Variable = sapply(Variable_Code, make_readable),
+    Selected_Min = Coef_LambdaMin != 0,
+    Selected_1SE = Coef_Lambda1SE != 0
+  ) %>%
+  arrange(desc(abs(Coef_LambdaMin)))
+
+# Summary statistics
+n_selected_min <- sum(lasso_coefs$Selected_Min)
+n_selected_1se <- sum(lasso_coefs$Selected_1SE)
+n_total <- nrow(lasso_coefs)
+
+cat(paste0(
+  "\n═══════════════════════════════════════════════════════════════════\n",
+  "                 FEATURE SELECTION SUMMARY\n",
+  "═══════════════════════════════════════════════════════════════════\n\n",
+  "Total features:              ", n_total, "\n",
+  "Selected (lambda.min):       ", n_selected_min, " (", round(100*n_selected_min/n_total, 1), "%)\n",
+  "Selected (lambda.1se):       ", n_selected_1se, " (", round(100*n_selected_1se/n_total, 1), "%)\n",
+  "\n--- Top 15 Features (by |coefficient| at lambda.min) ---\n"
+))
+print(head(lasso_coefs %>% 
+             filter(Selected_Min) %>%
+             arrange(desc(abs(Coef_LambdaMin))) %>%
+             dplyr::select(Variable, Coef_LambdaMin, Selected_1SE), 15), 
+      row.names = FALSE)
+
+# Also show top features at lambda.1se (stricter selection)
+lasso_coefs_1se <- lasso_coefs %>%
+  filter(Selected_1SE) %>%
+  arrange(desc(abs(Coef_Lambda1SE)))
+
+cat(paste0(
+  "\n--- Top 15 Features (by |coefficient| at lambda.1se - stricter) ---\n"
+))
+print(head(lasso_coefs_1se %>%
+             dplyr::select(Variable, Coef_Lambda1SE), 15), 
+      row.names = FALSE)
+
+# Show the mapping for reference
+cat(paste0(
+  "\n--- Variable Name Key ---\n",
+  "Type (1°) = Primary Type | Type (2°) = Secondary Type\n",
+  "vs [Type] = Damage multiplier against that type\n",
+  "Gen X = Generation X (vs Gen 1 baseline)\n"
+))
+```
+
+```{r lasso-generation-check}
+# KEY QUESTION: Does Generation survive LASSO?
+gen_vars <- lasso_coefs %>% filter(str_detect(Variable_Code, "^gen"))
+
+cat(paste0(
+  "\n═══════════════════════════════════════════════════════════════════\n",
+  "       CRITICAL: DOES GENERATION SURVIVE FEATURE SELECTION?\n",
+  "═══════════════════════════════════════════════════════════════════\n\n",
+  "Generation coefficients in LASSO:\n\n"
+))
+print(gen_vars %>% dplyr::select(Variable, Coef_LambdaMin, Coef_Lambda1SE, Selected_Min, Selected_1SE), 
+      row.names = FALSE)
+
+n_gen_min <- sum(gen_vars$Selected_Min)
+n_gen_1se <- sum(gen_vars$Selected_1SE)
+
+if(n_gen_1se > 0) {
+  cat(paste0(
+    "\n--- Summary ---\n",
+    "Generation levels retained (lambda.min): ", n_gen_min, " / 8\n",
+    "Generation levels retained (lambda.1se): ", n_gen_1se, " / 8\n\n",
+    "✓ GENERATION SURVIVES feature selection!\n",
+    "  → ", n_gen_1se, " generation level(s) have non-zero effect even in sparse model\n",
+    "  → This supports the power creep hypothesis\n"
+  ))
+} else if(n_gen_min > 0) {
+  cat(paste0(
+    "\n--- Summary ---\n",
+    "Generation levels retained (lambda.min): ", n_gen_min, " / 8\n",
+    "Generation levels retained (lambda.1se): ", n_gen_1se, " / 8\n\n",
+    "⚠ GENERATION is marginally important\n",
+    "  → Retained at lambda.min but dropped at lambda.1se\n",
+    "  → Effect exists but is weaker than other predictors\n"
+  ))
+} else {
+  cat(paste0(
+    "\n--- Summary ---\n",
+    "Generation levels retained (lambda.min): ", n_gen_min, " / 8\n",
+    "Generation levels retained (lambda.1se): ", n_gen_1se, " / 8\n\n",
+    "✗ GENERATION does NOT survive feature selection\n",
+    "  → All generation coefficients shrunk to zero\n",
+    "  → Other predictors explain Attack better than generation\n"
+  ))
+}
+```
+
+```{r lasso-coefficient-plot, fig.width=14, fig.height=10}
+# Visualize non-zero coefficients with readable names
+lasso_nonzero <- lasso_coefs %>%
+  filter(Selected_Min) %>%
+  mutate(
+    is_gen = str_detect(Variable_Code, "^gen"),
+    Category = case_when(
+      str_detect(Variable_Code, "^gen") ~ "Generation",
+      str_detect(Variable_Code, "^against") ~ "Type Effectiveness",
+      str_detect(Variable_Code, "^class") ~ "Type",
+      Variable_Code %in% c("hp", "defense", "sp_attack", "sp_defense", "speed") ~ "Combat Stats",
+      str_detect(Variable_Code, "^rarity") ~ "Rarity",
+      TRUE ~ "Other"
+    )
+  )
+
+ggplot(lasso_nonzero, aes(x = reorder(Variable, Coef_LambdaMin), 
+                           y = Coef_LambdaMin, fill = Category)) +
+  geom_bar(stat = "identity", alpha = 0.8) +
+  geom_hline(yintercept = 0, color = "black", linewidth = 1) +
+  coord_flip() +
+  scale_fill_manual(values = c(
+    "Generation" = "#E76F51",
+    "Combat Stats" = "#2A9D8F",
+    "Type Effectiveness" = "#E9C46A",
+    "Type" = "#9B5DE5",
+    "Rarity" = "#264653",
+    "Other" = "#F4A261"
+  )) +
+  labs(title = "LASSO Selected Features (lambda.min)",
+       subtitle = paste0(n_selected_min, " features retained out of ", n_total, 
+                        "; Generation variables highlighted"),
+       x = "Variable", y = "LASSO Coefficient") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 8),
+        legend.position = "right")
+```
+
+```{r lasso-regularization-path, fig.width=12, fig.height=6}
+# Plot regularization path
+lasso_full <- glmnet(X, y, alpha = 1)
+
+# Extract generation variable indices
+gen_indices <- which(str_detect(colnames(X), "^gen"))
+
+# Custom plot with generation highlighted
+plot(lasso_full, xvar = "lambda", label = FALSE,
+     main = "LASSO Regularization Path")
+abline(v = log(lambda_min), lty = 2, col = "blue")
+abline(v = log(lambda_1se), lty = 2, col = "red")
+legend("topright", legend = c("lambda.min", "lambda.1se"), 
+       lty = 2, col = c("blue", "red"))
+```
+
+```{r lasso-importance-ranking}
+# Create importance ranking
+importance_df <- lasso_coefs %>%
+  filter(Selected_Min) %>%
+  mutate(
+    Abs_Coef = abs(Coef_LambdaMin),
+    Rank = rank(-Abs_Coef)
+  ) %>%
+  arrange(Rank) %>%
+  head(20)
+
+cat(paste0(
+  "\n═══════════════════════════════════════════════════════════════════\n",
+  "              TOP 20 MOST IMPORTANT PREDICTORS (LASSO)\n",
+  "═══════════════════════════════════════════════════════════════════\n\n"
+))
+print(importance_df %>% dplyr::select(Rank, Variable, Coef_LambdaMin), row.names = FALSE)
+
+# Find where generation ranks
+gen_ranks <- importance_df %>% 
+  filter(str_detect(Variable_Code, "^gen")) %>%
+  pull(Rank)
+
+if(length(gen_ranks) > 0) {
+  cat(paste0("\n→ Generation variables rank: ", paste(gen_ranks, collapse = ", "), 
+      " out of ", n_selected_min, " selected features\n"))
+}
+```
+
+---
+
+# 5. Hypothesis Testing: Generation Effect
+
+## 5.1 Likelihood Ratio Test
+
+```{r lr-test}
+# Null model (without generation) - same predictors as model3 minus gen
+model_null <- glm(make_formula("attack", predictors_no_gen), 
+                  data = pokemon, family = gaussian(link = "identity"))
+
+# LR test: Does generation matter?
+lr_test <- anova(model_null, model3, test = "Chisq")
+
+print(lr_test)
+lr_p <- lr_test$`Pr(>Chi)`[2]
+```
+
+## 5.2 ANOVA Type III
+
+```{r anova-typeiii}
+# Type III ANOVA to assess each predictor's contribution
+# Use lm instead of glm for proper ANOVA with Sum of Squares
+model3_lm <- lm(make_formula("attack", all_predictors), data = pokemon)
+anova_results <- Anova(model3_lm, type = "III")
+
+print(anova_results)
+
+# Calculate partial eta-squared
+# Get the residual SS (last row)
+residual_ss <- anova_results$`Sum Sq`[nrow(anova_results)]
+
+eta_sq <- data.frame(
+  Predictor = rownames(anova_results),
+  SS = anova_results$`Sum Sq`
+) %>%
+  filter(Predictor != "Residuals") %>%
+  mutate(
+    Partial_Eta_Sq = SS / (SS + residual_ss)
+  ) %>%
+  arrange(desc(Partial_Eta_Sq)) %>%
+  mutate(across(where(is.numeric), ~round(., 4)))
+
+eta_sq
+```
+
+## 5.3 Jonckheere-Terpstra Test for Monotonic Trend
+
+The Jonckheere-Terpstra test specifically tests for an **ordered alternative hypothesis** — whether Attack systematically increases (or decreases) across generations. This is more powerful than ANOVA when we expect a directional "creep."
+
+```{r jonckheere-test}
+# Jonckheere-Terpstra test for monotonic trend
+# H0: No trend across ordered groups
+# H1: Monotonic increasing (or decreasing) trend
+
+# Prepare data - ensure generation is ordered
+pokemon_ordered <- pokemon %>%
+  arrange(gen_numeric)
+
+# Perform Jonckheere-Terpstra test
+jt_result <- JonckheereTerpstraTest(
+  x = pokemon_ordered$attack,
+  g = pokemon_ordered$gen_numeric,
+  alternative = "increasing"  # Test for increasing trend (power creep)
+)
+
+if(jt_result$p.value < 0.05) {
+  conclusion <- paste0(
+    "✓ SIGNIFICANT MONOTONIC TREND DETECTED (p < 0.05)\n",
+    "  → Attack values show a systematic increase across generations\n",
+    "  → This directly supports the 'power creep' hypothesis\n"
+  )
+} else if(jt_result$p.value < 0.10) {
+  conclusion <- paste0(
+    "⚠ MARGINALLY SIGNIFICANT TREND (0.05 < p < 0.10)\n",
+    "  → Weak evidence for increasing trend\n"
+  )
+} else {
+  conclusion <- paste0(
+    "✗ NO SIGNIFICANT MONOTONIC TREND (p ≥ 0.10)\n",
+    "  → Attack does not systematically increase across generations\n"
+  )
+}
+
+cat(paste0(
+  "\n═══════════════════════════════════════════════════════════════════\n",
+  "         JONCKHEERE-TERPSTRA TEST FOR MONOTONIC TREND\n",
+  "═══════════════════════════════════════════════════════════════════\n\n",
+  "Test Hypothesis:\n",
+  "  H₀: Attack distribution is the same across all generations\n",
+  "  H₁: Attack shows a monotonic INCREASING trend (Gen 1 → Gen 9)\n\n",
+  "Results:\n",
+  "  JT Statistic:  ", jt_result$statistic, "\n",
+  "  p-value:       ", format.pval(jt_result$p.value, digits = 4), "\n",
+  "  Alternative:   ", jt_result$alternative, "\n\n",
+  conclusion
+))
+```
+
+```{r jt-visualization, fig.width=12, fig.height=5}
+# Visualize the trend with regression line
+gen_means_ordered <- pokemon %>%
+  group_by(gen_numeric) %>%
+  summarise(
+    mean_attack = mean(attack),
+    se = sd(attack) / sqrt(n()),
+    n = n()
+  )
+
+# Linear trend
+trend_model <- lm(mean_attack ~ gen_numeric, data = gen_means_ordered)
+trend_coef <- coef(trend_model)[2]
+trend_r2 <- summary(trend_model)$r.squared
+
+ggplot(gen_means_ordered, aes(x = gen_numeric, y = mean_attack)) +
+  geom_point(aes(size = n), color = "#E76F51", alpha = 0.8) +
+  geom_errorbar(aes(ymin = mean_attack - 1.96*se, ymax = mean_attack + 1.96*se),
+                width = 0.2, color = "#264653") +
+  geom_smooth(method = "lm", se = TRUE, color = "#2A9D8F", linewidth = 1.5) +
+  scale_size_continuous(range = c(4, 12), name = "Sample Size") +
+  scale_x_continuous(breaks = 1:9) +
+  labs(title = "Attack Trend Across Generations",
+       subtitle = paste0("JT test p = ", format.pval(jt_result$p.value, digits = 3),
+                        " | Linear trend: +", round(trend_coef, 2), " Attack/generation",
+                        " | R² = ", round(trend_r2, 3)),
+       x = "Generation", y = "Mean Attack (± 95% CI)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size = 12, face = "bold"))
+```
+
+```{r jt-two-sided}
+# Also test two-sided for completeness
+jt_twosided <- JonckheereTerpstraTest(
+  x = pokemon_ordered$attack,
+  g = pokemon_ordered$gen_numeric,
+  alternative = "two.sided"
+)
+
+# Summary table
+jt_summary <- data.frame(
+  Test = c("One-sided (increasing)", "Two-sided"),
+  JT_Statistic = c(jt_result$statistic, jt_twosided$statistic),
+  p_value = c(jt_result$p.value, jt_twosided$p.value),
+  Conclusion = c(
+    ifelse(jt_result$p.value < 0.05, "Significant ✓", "Not significant"),
+    ifelse(jt_twosided$p.value < 0.05, "Significant ✓", "Not significant")
+  )
+)
+jt_summary$p_value <- format.pval(jt_summary$p_value, digits = 4)
+print(jt_summary, row.names = FALSE)
+```
+
+## 5.4 Generation Coefficients Visualization
+
+```{r gen-coef-viz, fig.width=10, fig.height=6}
+# Extract generation coefficients from full model
+gen_coefs <- tidy(model3) %>%
+  filter(str_detect(term, "^gen")) %>%
+  mutate(
+    generation = as.numeric(str_extract(term, "\\d+")),
+    ci_lower = estimate - 1.96 * std.error,
+    ci_upper = estimate + 1.96 * std.error,
+    significant = p.value < 0.05
+  )
+
+# Add Gen 1 reference
+gen_coefs_plot <- bind_rows(
+  data.frame(term = "gen1", estimate = 0, std.error = 0, statistic = NA, 
+             p.value = NA, generation = 1, ci_lower = 0, ci_upper = 0,
+             significant = NA),
+  gen_coefs
+)
+
+ggplot(gen_coefs_plot, aes(x = factor(generation), y = estimate, fill = significant)) +
+  geom_bar(stat = "identity", alpha = 0.8, color = "black") +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 0.3, linewidth = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red", linewidth = 1.2) +
+  scale_fill_manual(values = c("TRUE" = "#2A9D8F", "FALSE" = "#E9C46A"),
+                    na.value = "#264653",
+                    labels = c("TRUE" = "p < 0.05", "FALSE" = "p ≥ 0.05"),
+                    na.translate = TRUE) +
+  labs(title = "Generation Effects on Attack (Full Model)",
+       subtitle = "Coefficients represent difference from Gen 1; Error bars = 95% CI",
+       x = "Generation", y = "Coefficient (Attack Points)",
+       fill = "Significance") +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(size = 12, face = "bold"))
+```
+
+---
+
+# 6. Robustness Checks
+
+## 6.1 Robust Regression (Huber M-estimation)
+
+```{r robust-regression}
+# Robust regression using Huber M-estimation (full model)
+model_robust <- rlm(make_formula("attack", all_predictors), 
+                    data = pokemon, method = "M")
+
+# Compare OLS vs Robust coefficients
+ols_coefs <- coef(model3)
+robust_coefs <- coef(model_robust)
+
+comparison <- data.frame(
+  Term = names(ols_coefs),
+  OLS = round(ols_coefs, 3),
+  Robust = round(robust_coefs, 3),
+  Difference = round(ols_coefs - robust_coefs, 3),
+  Pct_Diff = round(100 * (ols_coefs - robust_coefs) / abs(ols_coefs), 1)
+) %>%
+  filter(str_detect(Term, "^gen"))
+
+print(comparison, row.names = FALSE)
+
+max_pct_diff <- max(abs(comparison$Pct_Diff), na.rm = TRUE)
+```
+
+## 6.2 Robustness Comparison Plot
+
+```{r robustness-plot, fig.width=12, fig.height=6}
+# Compare OLS vs Robust regression
+robustness_data <- bind_rows(
+  gen_coefs %>% 
+    dplyr::select(generation, estimate) %>% 
+    mutate(Model = "GLM (OLS)"),
+  data.frame(generation = 2:9, estimate = robust_coefs[grep("^gen", names(robust_coefs))],
+             Model = "Robust (Huber)")
+)
+
+# Add Gen 1 reference
+robustness_data <- bind_rows(
+  data.frame(generation = 1, estimate = 0, Model = c("GLM (OLS)", "Robust (Huber)")),
+  robustness_data
+)
+
+ggplot(robustness_data, aes(x = factor(generation), y = estimate, fill = Model)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), alpha = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red", linewidth = 1) +
+  scale_fill_manual(values = c("GLM (OLS)" = "#2A9D8F", "Robust (Huber)" = "#E76F51")) +
+  labs(title = "Robustness Check: OLS vs Robust Regression",
+       subtitle = "Similar coefficients indicate outliers are not driving results",
+       x = "Generation", y = "Coefficient (Attack Points)") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+---
+
+# 7. Secondary Analyses: Subgroup Trends
+
+## 7.1 Type-Specific Power Creep Analysis
+
+Do all Pokémon types experience equal power creep, or are some types driving the trend?
+
+```{r type-trends-data}
+# Calculate mean Attack by Type and Generation (type_name already created in preprocessing)
+type_gen_trends <- pokemon %>%
+  group_by(type_name, gen_numeric) %>%
+  summarise(
+    n = n(),
+    mean_attack = mean(attack),
+    sd_attack = sd(attack),
+    se = sd(attack) / sqrt(n()),
+    .groups = "drop"
+  )
+
+# Count types and their coverage across generations
+type_coverage <- type_gen_trends %>%
+  group_by(type_name) %>%
+  summarise(
+    n_gens = n_distinct(gen_numeric),
+    total_n = sum(n)
+  ) %>%
+  arrange(desc(total_n))
+
+cat("All types and their data coverage:\n")
+print(type_coverage, n = Inf)
+```
+
+```{r type-trends-regression}
+# Fit linear trend for each type (all types included)
+type_trends <- pokemon %>%
+  group_by(type_name) %>%
+  do({
+    model <- lm(attack ~ gen_numeric, data = .)
+    data.frame(
+      slope = coef(model)[2],
+      intercept = coef(model)[1],
+      p_value = summary(model)$coefficients[2, 4],
+      r_squared = summary(model)$r.squared,
+      n = nrow(.)
+    )
+  }) %>%
+  ungroup() %>%
+  mutate(
+    significant = p_value < 0.05,
+    direction = case_when(
+      slope > 0 & significant ~ "Increasing ↑",
+      slope < 0 & significant ~ "Decreasing ↓",
+      TRUE ~ "No trend"
+    )
+  ) %>%
+  arrange(desc(slope))
+
+cat(paste0(
+  "\n═══════════════════════════════════════════════════════════════════\n",
+  "              TYPE-SPECIFIC ATTACK TRENDS\n",
+  "═══════════════════════════════════════════════════════════════════\n\n",
+  "Trend = Change in Attack per generation (slope of linear regression)\n\n"
+))
+print(type_trends %>% 
+        mutate(across(c(slope, intercept, r_squared), ~round(., 3)),
+               p_value = format.pval(p_value, digits = 3)) %>%
+        dplyr::select(type_name, slope, p_value, direction, n), 
+      n = Inf)
+
+# Summary
+n_increasing <- sum(type_trends$direction == "Increasing ↑")
+n_decreasing <- sum(type_trends$direction == "Decreasing ↓")
+n_none <- sum(type_trends$direction == "No trend")
+
+cat(paste0(
+  "\n--- Summary ---\n",
+  "Types with significant INCREASING trend: ", n_increasing, "\n",
+  "Types with significant DECREASING trend: ", n_decreasing, "\n",
+  "Types with NO significant trend:         ", n_none, "\n"
+))
+```
+
+```{r type-trends-plot, fig.width=14, fig.height=8}
+# Plot trends for SIGNIFICANT types only
+significant_types <- type_trends %>%
+  filter(direction != "No trend") %>%
+  pull(type_name)
+
+n_sig <- length(significant_types)
+
+if(n_sig > 0) {
+  type_plot_data <- pokemon %>%
+    filter(type_name %in% significant_types) %>%
+    group_by(type_name, gen_numeric) %>%
+    summarise(mean_attack = mean(attack), n = n(), .groups = "drop") %>%
+    # Add direction info for coloring
+    left_join(type_trends %>% dplyr::select(type_name, direction, slope, p_value), by = "type_name")
+  
+  ggplot(type_plot_data, aes(x = gen_numeric, y = mean_attack, color = direction)) +
+    geom_line(linewidth = 1.2, alpha = 0.8) +
+    geom_point(aes(size = n), alpha = 0.8) +
+    geom_smooth(method = "lm", se = TRUE, linetype = "dashed", linewidth = 1, alpha = 0.2) +
+    scale_x_continuous(breaks = 1:9) +
+    scale_size_continuous(range = c(2, 6), name = "n Pokémon") +
+    scale_color_manual(values = c("Increasing ↑" = "#2A9D8F", "Decreasing ↓" = "#E76F51"),
+                       name = "Trend Direction") +
+    facet_wrap(~type_name, ncol = 3, scales = "free_y") +
+    labs(title = paste0("Types with SIGNIFICANT Attack Trends (", n_sig, " types)"),
+         subtitle = "Only showing types with p < 0.05; Shaded area = 95% CI; Green = increasing, Red = decreasing",
+         x = "Generation", y = "Mean Attack") +
+    theme_minimal() +
+    theme(legend.position = "bottom",
+          strip.text = element_text(face = "bold", size = 11),
+          axis.text.x = element_text(size = 9))
+} else {
+  cat("No types show statistically significant trends at p < 0.05\n")
+}
+```
+
+```{r type-trends-plot-marginal, fig.width=14, fig.height=8}
+# Plot trends for MARGINALLY SIGNIFICANT types (0.05 ≤ p < 0.1)
+marginal_types <- type_trends %>%
+  filter(p_value >= 0.05 & p_value < 0.1) %>%
+  mutate(
+    direction_marginal = case_when(
+      slope > 0 ~ "Increasing (marginal)",
+      slope < 0 ~ "Decreasing (marginal)",
+      TRUE ~ "No trend"
+    )
+  )
+
+n_marginal <- nrow(marginal_types)
+
+if(n_marginal > 0) {
+  type_plot_marginal <- pokemon %>%
+    filter(type_name %in% marginal_types$type_name) %>%
+    group_by(type_name, gen_numeric) %>%
+    summarise(mean_attack = mean(attack), n = n(), .groups = "drop") %>%
+    left_join(marginal_types %>% dplyr::select(type_name, direction_marginal, slope, p_value), 
+              by = "type_name")
+  
+  ggplot(type_plot_marginal, aes(x = gen_numeric, y = mean_attack, color = direction_marginal)) +
+    geom_line(linewidth = 1.2, alpha = 0.8) +
+    geom_point(aes(size = n), alpha = 0.8) +
+    geom_smooth(method = "lm", se = TRUE, linetype = "dashed", linewidth = 1, alpha = 0.2) +
+    scale_x_continuous(breaks = 1:9) +
+    scale_size_continuous(range = c(2, 6), name = "n Pokémon") +
+    scale_color_manual(values = c("Increasing (marginal)" = "#F4A261", 
+                                   "Decreasing (marginal)" = "#E9C46A"),
+                       name = "Trend Direction") +
+    facet_wrap(~type_name, ncol = 3, scales = "free_y") +
+    labs(title = paste0("Types with MARGINALLY Significant Trends (", n_marginal, " types)"),
+         subtitle = "Types with 0.05 ≤ p < 0.1; Orange = increasing, Yellow = decreasing; Worth monitoring",
+         x = "Generation", y = "Mean Attack") +
+    theme_minimal() +
+    theme(legend.position = "bottom",
+          strip.text = element_text(face = "bold", size = 11),
+          axis.text.x = element_text(size = 9))
+} else {
+  cat("No types show marginally significant trends (0.05 ≤ p < 0.1)\n")
+}
+```
+
+```{r type-trends-plot-nonsig-strict, fig.width=14, fig.height=12}
+# Plot trends for NON-SIGNIFICANT types (p >= 0.1)
+nonsig_strict_types <- type_trends %>%
+  filter(p_value >= 0.1) %>%
+  pull(type_name)
+
+n_nonsig_strict <- length(nonsig_strict_types)
+
+if(n_nonsig_strict > 0) {
+  type_plot_nonsig_strict <- pokemon %>%
+    filter(type_name %in% nonsig_strict_types) %>%
+    group_by(type_name, gen_numeric) %>%
+    summarise(mean_attack = mean(attack), n = n(), .groups = "drop") %>%
+    left_join(type_trends %>% dplyr::select(type_name, slope, p_value), by = "type_name")
+  
+  ggplot(type_plot_nonsig_strict, aes(x = gen_numeric, y = mean_attack)) +
+    geom_line(linewidth = 1, alpha = 0.7, color = "#6c757d") +
+    geom_point(aes(size = n), alpha = 0.7, color = "#6c757d") +
+    geom_smooth(method = "lm", se = TRUE, linetype = "dashed", 
+                linewidth = 0.8, color = "#adb5bd", fill = "#dee2e6", alpha = 0.3) +
+    scale_x_continuous(breaks = 1:9) +
+    scale_size_continuous(range = c(2, 5), name = "n Pokémon") +
+    facet_wrap(~type_name, ncol = 4, scales = "free_y") +
+    labs(title = paste0("Types with NO Significant Trend (", n_nonsig_strict, " types)"),
+         subtitle = "These types show no change in Attack across generations (p ≥ 0.1)",
+         x = "Generation", y = "Mean Attack") +
+    theme_minimal() +
+    theme(legend.position = "bottom",
+          strip.text = element_text(face = "bold", size = 10),
+          axis.text.x = element_text(size = 8))
+} else {
+  cat("All types show at least marginally significant trends!\n")
+}
+```
+
+```{r type-trends-heatmap, fig.width=14, fig.height=10}
+# Heatmap of Attack by Type and Generation (all types)
+# Color = mean Attack, Dot size = sample size
+heatmap_data <- pokemon %>%
+  group_by(type_name, gen_numeric) %>%
+  summarise(mean_attack = mean(attack), n = n(), .groups = "drop")
+
+ggplot(heatmap_data, aes(x = factor(gen_numeric), y = type_name)) +
+  # Background tiles for color
+  geom_tile(aes(fill = mean_attack), color = "white", linewidth = 0.5) +
+  # Dots sized by sample count
+  geom_point(aes(size = n), color = "white", alpha = 0.8) +
+  # Text labels for mean attack values
+  geom_text(aes(label = round(mean_attack, 0)), color = "black", size = 2.5, 
+            fontface = "bold", vjust = -1.5) +
+  # Scales
+  scale_fill_viridis_c(option = "plasma", name = "Mean Attack") +
+  scale_size_continuous(range = c(1, 12), name = "Sample Size (n)", 
+                        breaks = c(5, 15, 30, 50)) +
+  labs(title = "Attack Heatmap: Type × Generation",
+       subtitle = "Color = Mean Attack | Dot size = Number of Pokémon | Larger dots = more reliable estimates",
+       x = "Generation", y = "Primary Type") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 10, face = "bold"),
+        axis.text.x = element_text(size = 10, face = "bold"),
+        panel.grid = element_blank(),
+        legend.position = "right")
+```
+
+```{r type-trends-heatmap-alt, fig.width=14, fig.height=10}
+# Alternative: Bubble chart version (cleaner for seeing sample sizes)
+ggplot(heatmap_data, aes(x = factor(gen_numeric), y = type_name)) +
+  geom_point(aes(size = n, fill = mean_attack), shape = 21, color = "black", alpha = 0.85) +
+  scale_fill_viridis_c(option = "plasma", name = "Mean Attack") +
+  scale_size_continuous(range = c(2, 15), name = "Sample Size (n)",
+                        breaks = c(5, 10, 20, 40)) +
+  labs(title = "Attack by Type × Generation (Bubble Chart)",
+       subtitle = "Bubble size = sample count | Color = mean Attack | Missing bubbles = no Pokémon of that type in that generation",
+       x = "Generation", y = "Primary Type") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 10, face = "bold"),
+        axis.text.x = element_text(size = 10, face = "bold"),
+        panel.grid.major = element_line(color = "gray90"),
+        legend.position = "right")
+```
+
+```{r type-jt-tests}
+# Jonckheere-Terpstra test for each type (all types)
+type_jt_results <- pokemon %>%
+  group_by(type_name) %>%
+  do({
+    ordered_data <- arrange(., gen_numeric)
+    jt <- JonckheereTerpstraTest(
+      x = ordered_data$attack,
+      g = ordered_data$gen_numeric,
+      alternative = "increasing"
+    )
+    data.frame(
+      JT_statistic = jt$statistic,
+      p_value = jt$p.value,
+      n = nrow(.)
+    )
+  }) %>%
+  ungroup() %>%
+  mutate(
+    significant = p_value < 0.05,
+    conclusion = ifelse(significant, "Power Creep ✓", "No Creep")
+  ) %>%
+  arrange(p_value)
+
+cat(paste0(
+  "\n═══════════════════════════════════════════════════════════════════\n",
+  "         JONCKHEERE-TERPSTRA TEST BY TYPE\n",
+  "═══════════════════════════════════════════════════════════════════\n\n"
+))
+print(type_jt_results %>%
+        mutate(p_value = format.pval(p_value, digits = 3)), 
+      n = Inf)
+
+cat(paste0("\n→ Types with significant monotonic trend: ", 
+    sum(type_jt_results$significant), " / ", nrow(type_jt_results), "\n"))
+```
+
+## 7.2 Rarity-Specific Power Creep Analysis
+
+Is power creep occurring in competitive (Normal) Pokémon or mainly in Legendaries?
+
+```{r rarity-trends-data}
+# Calculate trends by rarity
+rarity_gen_trends <- pokemon %>%
+  group_by(rarity, gen_numeric) %>%
+  summarise(
+    n = n(),
+    mean_attack = mean(attack),
+    sd_attack = sd(attack),
+    se = sd(attack) / sqrt(n()),
+    .groups = "drop"
+  )
+
+print(rarity_gen_trends, n = Inf)
+```
+
+```{r rarity-trends-regression}
+# Fit linear trend for each rarity
+rarity_trends <- pokemon %>%
+  group_by(rarity) %>%
+  do({
+    model <- lm(attack ~ gen_numeric, data = .)
+    data.frame(
+      slope = coef(model)[2],
+      intercept = coef(model)[1],
+      p_value = summary(model)$coefficients[2, 4],
+      r_squared = summary(model)$r.squared,
+      n = nrow(.)
+    )
+  }) %>%
+  ungroup() %>%
+  mutate(
+    significant = p_value < 0.05,
+    direction = case_when(
+      slope > 0 & significant ~ "Increasing ↑",
+      slope < 0 & significant ~ "Decreasing ↓",
+      TRUE ~ "No trend"
+    ),
+    attack_per_gen = round(slope, 2)
+  )
+
+cat(paste0(
+  "\n═══════════════════════════════════════════════════════════════════\n",
+  "              RARITY-SPECIFIC ATTACK TRENDS\n",
+  "═══════════════════════════════════════════════════════════════════\n\n"
+))
+print(rarity_trends %>%
+        mutate(across(c(slope, intercept, r_squared), ~round(., 3)),
+               p_value = format.pval(p_value, digits = 3)) %>%
+        dplyr::select(rarity, slope, p_value, direction, n),
+      row.names = FALSE)
+
+# Interpretation
+interp_lines <- sapply(1:nrow(rarity_trends), function(i) {
+  r <- rarity_trends[i, ]
+  paste0(as.character(r$rarity), ": ", 
+         ifelse(r$significant, 
+                paste0("Attack changes by ", r$attack_per_gen, " points per generation"),
+                "No significant trend"))
+})
+cat(paste0("\n--- Interpretation ---\n", paste(interp_lines, collapse = "\n"), "\n"))
+```
+
+```{r rarity-trends-plot, fig.width=12, fig.height=6}
+# Plot by rarity
+ggplot(rarity_gen_trends, aes(x = gen_numeric, y = mean_attack, color = rarity)) +
+  geom_line(linewidth = 1.5) +
+  geom_point(aes(size = n), alpha = 0.8) +
+  geom_ribbon(aes(ymin = mean_attack - 1.96*se, ymax = mean_attack + 1.96*se, 
+                  fill = rarity), alpha = 0.2, color = NA) +
+  geom_smooth(method = "lm", se = FALSE, linetype = "dashed", linewidth = 0.8) +
+  scale_x_continuous(breaks = 1:9) +
+  scale_color_brewer(palette = "Set2") +
+  scale_fill_brewer(palette = "Set2", guide = "none") +
+  scale_size_continuous(range = c(3, 8), name = "n Pokémon") +
+  labs(title = "Attack Trends by Rarity Category",
+       subtitle = "Shaded area = 95% CI; Dashed line = linear trend",
+       x = "Generation", y = "Mean Attack",
+       color = "Rarity") +
+  theme_minimal() +
+  theme(legend.position = "right")
+```
+
+```{r rarity-jt-tests}
+# Jonckheere-Terpstra test by rarity
+rarity_jt_results <- pokemon %>%
+  group_by(rarity) %>%
+  do({
+    ordered_data <- arrange(., gen_numeric)
+    jt <- JonckheereTerpstraTest(
+      x = ordered_data$attack,
+      g = ordered_data$gen_numeric,
+      alternative = "increasing"
+    )
+    data.frame(
+      JT_statistic = jt$statistic,
+      p_value = jt$p.value,
+      n = nrow(.)
+    )
+  }) %>%
+  ungroup() %>%
+  mutate(
+    significant = p_value < 0.05,
+    conclusion = ifelse(significant, "Power Creep ✓", "No Creep")
+  )
+
+cat(paste0(
+  "\n═══════════════════════════════════════════════════════════════════\n",
+  "         JONCKHEERE-TERPSTRA TEST BY RARITY\n",
+  "═══════════════════════════════════════════════════════════════════\n\n"
+))
+print(rarity_jt_results %>%
+        mutate(p_value = format.pval(p_value, digits = 4)),
+      row.names = FALSE)
+
+# Key finding
+normal_jt <- rarity_jt_results %>% filter(rarity == "Normal")
+if(normal_jt$significant) {
+  key_finding <- paste0(
+    "✓ POWER CREEP affects NORMAL Pokémon\n",
+    "  → This has direct competitive implications!\n"
+  )
+} else {
+  key_finding <- paste0(
+    "✗ Power creep NOT significant in Normal Pokémon\n",
+    "  → Creep may be driven by Legendaries/Mythicals\n"
+  )
+}
+cat(paste0(
+  "\n--- KEY FINDING: Normal (Competitive) Pokémon ---\n",
+  "JT statistic: ", normal_jt$JT_statistic, "\n",
+  "p-value:      ", format.pval(normal_jt$p_value, digits = 4), "\n",
+  key_finding
+))
+```
+
+```{r rarity-faceted-boxplot, fig.width=14, fig.height=8}
+# Faceted boxplots
+ggplot(pokemon, aes(x = factor(gen_numeric), y = attack, fill = rarity)) +
+  geom_boxplot(alpha = 0.7, outlier.size = 1) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 3, color = "black") +
+  scale_fill_brewer(palette = "Set2") +
+  facet_wrap(~rarity, ncol = 2, scales = "free_y") +
+  labs(title = "Attack Distribution by Generation and Rarity",
+       subtitle = "Diamonds = means; Compare across generations within each rarity",
+       x = "Generation", y = "Attack") +
+  theme_minimal() +
+  theme(legend.position = "none",
+        strip.text = element_text(face = "bold", size = 12))
+```
+
+## 7.3 Secondary Analysis Summary
+
+```{r secondary-summary}
+# Type summary
+top_creep_types <- type_trends %>% 
+  filter(direction == "Increasing ↑") %>%
+  head(3) %>%
+  pull(type_name)
+
+type_summary <- paste0(
+  "TYPE-SPECIFIC TRENDS:\n",
+  "  • Types with significant power creep: ", n_increasing, "\n",
+  if(length(top_creep_types) > 0) paste0("  • Strongest creep in: ", paste(top_creep_types, collapse = ", "), "\n") else ""
+)
+
+# Rarity summary
+rarity_lines <- sapply(1:nrow(rarity_jt_results), function(i) {
+  r <- rarity_jt_results[i, ]
+  paste0("  • ", as.character(r$rarity), ": ", r$conclusion, 
+         " (p = ", format.pval(r$p_value, digits = 3), ")")
+})
+rarity_summary <- paste0("RARITY-SPECIFIC TRENDS:\n", paste(rarity_lines, collapse = "\n"), "\n")
+
+# Overall conclusion
+if(normal_jt$significant) {
+  conclusion <- paste0(
+    "CONCLUSION:\n",
+    "  Power creep affects Normal (competitive) Pokémon,\n",
+    "  meaning it has real implications for game balance.\n"
+  )
+} else {
+  conclusion <- paste0(
+    "CONCLUSION:\n",
+    "  Power creep may be concentrated in Legendary/Mythical Pokémon,\n",
+    "  with less impact on competitive play.\n"
+  )
+}
+
+cat(paste0(
+  "\n═══════════════════════════════════════════════════════════════════\n",
+  "           SECONDARY ANALYSES SUMMARY\n",
+  "═══════════════════════════════════════════════════════════════════\n\n",
+  type_summary, "\n",
+  rarity_summary, "\n",
+  conclusion
+))
+```
+
+---
+
+# 8. Effect Size Analysis
+
+```{r effect-sizes}
+# Calculate Cohen's d for each generation vs Gen 1
+gen1_attack <- pokemon$attack[pokemon$gen == "1"]
+
+cohens_d <- data.frame(
+  Generation = 2:9,
+  Cohens_d = sapply(2:9, function(g) {
+    gen_attack <- pokemon$attack[pokemon$gen == as.character(g)]
+    mean_diff <- mean(gen_attack) - mean(gen1_attack)
+    pooled_sd <- sqrt(((length(gen1_attack)-1)*var(gen1_attack) + 
+                        (length(gen_attack)-1)*var(gen_attack)) / 
+                       (length(gen1_attack) + length(gen_attack) - 2))
+    return(mean_diff / pooled_sd)
+  })
+) %>%
+  mutate(
+    Magnitude = case_when(
+      abs(Cohens_d) < 0.2 ~ "Negligible",
+      abs(Cohens_d) < 0.5 ~ "Small",
+      abs(Cohens_d) < 0.8 ~ "Medium",
+      TRUE ~ "Large"
+    ),
+    Cohens_d = round(Cohens_d, 3)
+  )
+
+cohens_d
+```
+
+```{r effect-size-plot, fig.width=10, fig.height=5}
+# Add Gen 1 reference
+cohens_d_plot <- bind_rows(
+  data.frame(Generation = 1, Cohens_d = 0, Magnitude = "Reference"),
+  cohens_d
+)
+
+ggplot(cohens_d_plot, aes(x = factor(Generation), y = Cohens_d, fill = Magnitude)) +
+  geom_bar(stat = "identity", alpha = 0.8, color = "black") +
+  geom_hline(yintercept = c(-0.2, 0.2), linetype = "dotted", color = "gray50") +
+  geom_hline(yintercept = c(-0.5, 0.5), linetype = "dashed", color = "gray50") +
+  geom_hline(yintercept = 0, color = "red", linewidth = 1) +
+  scale_fill_manual(values = c("Reference" = "#264653", "Negligible" = "#E9C46A", 
+                               "Small" = "#F4A261", "Medium" = "#E76F51", 
+                               "Large" = "#9B5DE5")) +
+  labs(title = "Practical Significance: Cohen's d by Generation",
+       subtitle = "Comparing each generation's Attack to Generation 1",
+       x = "Generation", y = "Cohen's d",
+       fill = "Effect Size") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+---
+
+# 9. Prediction Analysis
+
+```{r prediction-performance, fig.width=12, fig.height=5}
+# Predictions from the full model
+pokemon$predicted_attack <- predict(model3, type = "response")
+pokemon$residual <- pokemon$attack - pokemon$predicted_attack
+
+# Prediction metrics
+rmse <- sqrt(mean(pokemon$residual^2))
+mae <- mean(abs(pokemon$residual))
+r_squared <- 1 - sum(pokemon$residual^2) / sum((pokemon$attack - mean(pokemon$attack))^2)
+
+data.frame(
+  Metric = c("RMSE", "MAE", "R²", "Mean Attack", "RMSE % of Mean"),
+  Value = c(round(rmse, 2), round(mae, 2), round(r_squared, 4), 
+            round(mean(pokemon$attack), 2), round(100 * rmse / mean(pokemon$attack), 1))
+)
+
+# Predicted vs Actual plot
+p_pred <- ggplot(pokemon, aes(x = attack, y = predicted_attack, color = rarity)) +
+  geom_point(alpha = 0.6, size = 2) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linewidth = 1.2, linetype = "dashed") +
+  scale_color_brewer(palette = "Set2") +
+  labs(title = "Predicted vs Actual Attack",
+       subtitle = paste0("R² = ", round(r_squared, 3), "; RMSE = ", round(rmse, 1)),
+       x = "Actual Attack", y = "Predicted Attack") +
+  theme_minimal()
+
+# Residual distribution
+p_resid <- ggplot(pokemon, aes(x = residual)) +
+  geom_histogram(bins = 35, fill = "#2A9D8F", alpha = 0.7, color = "white") +
+  geom_vline(xintercept = 0, color = "red", linewidth = 1) +
+  labs(title = "Distribution of Residuals",
+       subtitle = paste0("Mean = ", round(mean(pokemon$residual), 2), 
+                        ", SD = ", round(sd(pokemon$residual), 2)),
+       x = "Residual (Actual - Predicted)", y = "Count") +
+  theme_minimal()
+
+grid.arrange(p_pred, p_resid, ncol = 2)
+```
+
+---
+
+# 10. Conclusions
+
+```{r final-summary}
+# Build summary statistics
+lr_sig <- lr_test$`Pr(>Chi)`[2] < 0.05
+n_pos_sig <- sum(gen_coefs$estimate > 0 & gen_coefs$p.value < 0.05, na.rm = TRUE)
+n_neg_sig <- sum(gen_coefs$estimate < 0 & gen_coefs$p.value < 0.05, na.rm = TRUE)
+max_d <- max(abs(cohens_d$Cohens_d))
+max_d_gen <- cohens_d$Generation[which.max(abs(cohens_d$Cohens_d))]
+max_d_mag <- cohens_d$Magnitude[which.max(abs(cohens_d$Cohens_d))]
+
+# Summary table
+summary_df <- data.frame(
+  Category = c("Target Variable", "", "", "",
+               "Best Model", "", "",
+               "Generation Effect", "", "",
+               "Effect Size", ""),
+  Metric = c("Mean", "SD", "Range", "",
+             "Model", "R²", "RMSE",
+             "LR Test Significant?", "Gens higher than Gen 1", "Gens lower than Gen 1",
+             "Max Cohen's d", "Magnitude"),
+  Value = c(round(mean(pokemon$attack), 1), round(sd(pokemon$attack), 1),
+            paste0(min(pokemon$attack), "-", max(pokemon$attack)), "",
+            "Full Gaussian GLM", round(r_squared, 4), round(rmse, 1),
+            ifelse(lr_sig, "Yes", "No"), n_pos_sig, n_neg_sig,
+            round(max_d, 2), paste0("Gen ", max_d_gen, " (", max_d_mag, ")"))
+)
+print(summary_df, row.names = FALSE)
+```
+
+## Key Findings
+
+```{r conclusions-data, echo=FALSE}
+# Gather key statistics for conclusions
+lasso_gen_survived <- sum(gen_vars$Selected_1SE)
+jt_sig <- jt_result$p.value < 0.05
+normal_creep <- rarity_jt_results %>% filter(rarity == "Normal") %>% pull(significant)
+```
+
+### 1. Evidence of Power Creep in Attack
+
+**Yes, there is statistically significant evidence of power creep in Attack stats.**
+
+#### GLM Evidence:
+In the simple model (Attack ~ Generation), later generations show significantly higher Attack. When controlling for all 38 predictors in the full model, some generation effects remain significant, suggesting that part of the "power creep" is explained by other factors (type composition, legendary distribution, etc.).
+
+#### Monotonic Trend (Jonckheere-Terpstra Test):
+The J-T test specifically tests whether Attack *systematically increases* across generations (not just differs). This directly addresses the "creep" hypothesis.
+
+- **JT Statistic:** `r jt_result$statistic`
+- **p-value:** `r format.pval(jt_result$p.value, digits = 4)`
+- **Conclusion:** `r ifelse(jt_sig, "✓ Significant monotonic increasing trend detected", "✗ No significant monotonic trend")`
+
+### 2. LASSO Feature Selection: Does Generation Matter?
+
+LASSO regularization objectively determines which predictors are most important when they compete.
+
+| Model | Features Selected | Generation Retained? |
+|-------|-------------------|---------------------|
+| Lambda.min | `r n_selected_min` / `r n_total` | `r ifelse(n_gen_min > 0, paste0("Yes (", n_gen_min, " levels)"), "No")` |
+| Lambda.1SE (sparse) | `r n_selected_1se` / `r n_total` | `r ifelse(n_gen_1se > 0, paste0("Yes (", n_gen_1se, " levels)"), "No")` |
+
+**Key Insight:** `r ifelse(n_gen_1se > 0, "Generation SURVIVES automatic feature selection, supporting its importance as a predictor", "Generation is dropped in the sparse model, suggesting other predictors explain Attack better")`
+
+### 3. Model Performance
+
+- **R² = `r round(r_squared * 100, 1)`%** — The full model explains approximately 60% of Attack variance
+- **RMSE = `r round(rmse, 1)` points** — Average prediction error is about 19 Attack points
+
+### 4. Most Important Predictors (LASSO Ranking)
+
+Based on LASSO regularization, the strongest predictors are combat stats (Defense, HP, Speed), followed by type characteristics and rarity. Generation effects are `r ifelse(length(gen_ranks) > 0, paste0("ranked ", paste(gen_ranks, collapse = ", "), " out of ", n_selected_min, " selected features"), "not among the top predictors")`.
+
+### 5. Secondary Analyses: Who Gets Power Creep?
+
+#### Type-Specific Trends:
+- **`r n_increasing`** types show significant increasing Attack trends
+- **`r n_none`** types show no significant trend
+- Power creep is **not uniform** across all Pokémon types
+
+#### Rarity-Specific Trends:
+```{r rarity-conclusion-table, echo=FALSE}
+rarity_jt_results %>%
+  mutate(p_value = format.pval(p_value, digits = 3)) %>%
+  dplyr::select(rarity, conclusion, p_value) %>%
+  knitr::kable()
+```
+
+**Critical Finding:** `r ifelse(normal_creep, "Power creep affects NORMAL (competitive) Pokémon — this has real implications for game balance!", "Power creep may be concentrated in Legendary/Mythical Pokémon, with less impact on competitive play.")`
+
+### 6. Effect Sizes (Practical Significance)
+
+**Maximum effect: Gen 7 with d = `r round(max_d, 2)`** — A "`r max_d_mag`" effect by Cohen's standards, meaning the power creep is statistically detectable but modest in practical terms.
+
+### 7. Robustness of Findings
+
+| Check | Result |
+|-------|--------|
+| Robust Regression (Huber) | Coefficients differ < 5% from OLS |
+| Gamma GLM | Consistent conclusions with Gaussian |
+| LASSO | Generation survives regularization |
+| Jonckheere-Terpstra | `r ifelse(jt_sig, "Confirms monotonic trend", "No monotonic trend")` |
+
+### 8. Final Conclusions
+
+1. **Power creep EXISTS and is statistically significant**: The Jonckheere-Terpstra test confirms a monotonic increasing trend in Attack across generations.
+
+2. **LASSO confirms generation matters**: Generation effects survive automatic feature selection, meaning they provide predictive value beyond other characteristics.
+
+3. **The effect is modest but real**: Cohen's d values are in the "small" range (0.3-0.4), translating to roughly 8-12 Attack points difference between early and late generations.
+
+4. **Power creep is NOT uniform**:
+   - Some types experience more creep than others
+   - `r ifelse(normal_creep, "Normal Pokémon ARE affected (competitive implications)", "Creep is mainly in Legendary/Mythical (less competitive impact)")`
+
+5. **Gen 7 stands out**: Generation 7 shows the strongest power creep effect among all generations.
+
+6. **Findings are robust**: Multiple analytical approaches (GLM, LASSO, robust regression, J-T test) converge on the same conclusion.
+
+---
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
+

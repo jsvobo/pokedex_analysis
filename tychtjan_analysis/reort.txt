@@ -1,0 +1,231 @@
+GLM Analysis
+The goal of this analysis is to determine whether power creep exists in Pokémon combat statistics — defined here as a statistically demonstrable increase in either Attack or the sum of core combat stats across generations. We use Generalized Linear Models (GLMs) to test whether generation predicts higher values in these outcomes, while ensuring that all relevant distributional and structural assumptions are properly evaluated.
+Power creep, in this simplified form, is present if:
+Attack increases systematically across generations, and
+The total combat stat score increases systematically across generations.
+What do we need to know to use GLMs ? 
+
+To use Generalized Linear Models correctly, we must determine:
+
+    1. What TYPE of variables are we modeling?
+    2. What DISTRIBUTION does it follow?
+    3. How does VARIANCE relate to the MEAN?
+    4. What LINK FUNCTION is appropriate?
+    5. Are observations INDEPENDENT?
+
+
+We will examine each of these requirements in the sections that follow, which then inform the final modeling strategy and the pre-specified criteria for detecting evidence of power creep.
+
+Important note: The primary analysis uses the full dataset, including outliers, to understand the unpruned behavior of the data. We then repeat key models on an outlier-cleaned dataset derived from a separate outlier analysis as a robustness check.
+
+Type of variables
+Generation is treated as a categorical factor, with Generation 1 as the reference. This avoids imposing a linear trend and allows detection of non-monotonic patterns that are common in Pokémon stats. Each coefficient estimates how much higher or lower a given generation’s mean stat is compared to Generation 1. The rest of the variables are numeric.
+
+Distribution of the response
+Examining the distribution of Attack is important because substantial skewness or heavy tails in the raw values often translate into non-normal residuals when using Gaussian models. Assessing the Attack distribution therefore helps anticipate potential modeling issues and informs whether alternative distributions (e.g., Gamma) should be considered for robustness.
+
+
+Examining the Attack distribution across generations shows generally mild positive skew. Overall, Attack is close to symmetric (skew = 0.28), which supports the suitability of a Gaussian GLM for modeling this variable. For completeness, we also estimate Gamma GLMs with log links as robustness checks to account for any residual skewness.
+Variance-mean relationship
+A critical distinction between GLM families lies in how they model the relationship between variance and mean. Gaussian models assume constant variance, meaning the spread of the data remains the same regardless of the predicted value. Poisson models assume variance equals the mean, which is appropriate for count data. Gamma models assume variance is proportional to the square of the mean, making them suitable when larger values show more variability.
+
+For our analysis, we need to determine whether the variance of combat stats remains constant across generations, or whether it changes systematically. If variance increases with higher means, a Gamma model might be more appropriate than Gaussian.
+
+CHECKING VARIANCE FOR SIMPLE MODEL (stat ~ generation)
+
+Since generation is a categorical factor with 9 levels, a simple model like "attack ~ gen" produces only 9 unique fitted values, one for each generation. 
+
+The left graph tells us that while the bars vary slightly (from a low of 25.6 to a high of 32.9), they are all roughly the same height and hover near the red average line. The right plot shows the box plots spread of data for each generation. Here we see that all of the boxes are visually relatively similar in height. From both of these graphs we can safely conclude that homoscedasticity is met for the simple model.
+
+CHECKING VARIANCE FOR FULL MODEL
+Simple models are not representative of our actual analysis, which will include multiple predictors. When we add continuous control variables (HP, Defense, Speed, etc.), the fitted values gain proper continuous spread, and standard diagnostic plots become meaningful.
+
+
+Looking at the first plot we can see that there are slight deviations at the tails, but overall we are looking at homoscedastic behavior. Let’s look at the Scale-Location Plot.
+
+In this one we can see a slight upward slope suggesting a mild heteroscedasticity. We can try transformation of our data (log or sqrt) if that would fix the heteroscedasticity.
+
+Looking at the plots and also examining the formal testing - Breusch-Pagan Test, we can see that heteroscadisticity is statistically significant and we need to take that into account. The Breusch-Pagan test returns p-values well below 0.05 (p < 0.001), indicating that we reject the null hypothesis of homoscedasticity..
+
+             Metric     Original            Log         Sqrt
+  Response Variable       Attack    log(Attack)      √Attack
+       BP Statistic       144.03         155.43       144.04
+         BP p-value    1.513e-05      9.138e-07    1.507e-05
+
+Checking the Q-Q plots we can see that there is a trail at the left side. In the original models the trail seems to be more consistent than in the other transformations, so we will stick to no transformed model, since even the BP value is similar to the square root one. 
+
+However, statistically significant results are expected in the Breusch–Pagan test given our large sample size (N > 1,000), where even negligible deviations from constant variance are flagged as significant. Visual inspection of the Scale-Location plots reveals only a mild upward trend rather than severe 'funnel' patterns. Therefore, we conclude that while strict homoscedasticity is technically violated, the deviation is not severe enough to invalidate the model structure. To remain rigorous, we will keep the Identity link but supplement our analysis with Heteroscedasticity-Consistent (HC3) standard errors, ensuring our inference remains valid even in the presence of this mild variance heterogeneity."
+
+Choosing the Link function
+As mentioned in the previous chapter, we use the identity link because effects are expected to be additive. While a log link enforces positivity, Pokémon stats are sufficiently far from zero that an identity link is unlikely to produce impossible negative predictions, and it offers easier interpretation of coefficients (absolute point increases rather than percentage multipliers).
+
+Independence of observations
+Each Pokémon entry is treated as an independent observation. While some Pokémon are evolutionarily related, combat stats are defined at the species level and are fixed design parameters rather than stochastic outcomes. As such, dependence induced by evolutionary lines is structural rather than statistical, and does not violate the conditional independence assumption of the GLM. Furthermore, robustness checks excluding alternate forms yield substantively similar results.
+
+
+Model Specification and Hypothesis Testing
+Having verified that a Gaussian GLM with an identity link is appropriate, we now specify the models used to test for evidence of power creep in Pokémon combat statistics. The analysis examines whether Pokémon introduced in later generations exhibit higher Attack values or higher total combat stat scores relative to Generation 1.
+For each outcome variable, we estimate a GLM with generation included as a categorical predictor, using Generation 1 as the reference level. This specification allows generational differences without imposing a linear trend. Additional combat statistics are included as control variables to account for trade-offs among stats.
+All models are estimated using heteroscedasticity-consistent (HC3) standard errors to account for mild variance heterogeneity. The same specifications are re-estimated on an outlier-cleaned dataset as a robustness check.
+Basic model analysis
+
+The simple model (Attack ~ Generation) treats Generation 1 as the reference category. Examining the generation coefficients, we observe that later generations tend to have higher Attack values:
+
+| Generation | Coefficient | p-value | Interpretation |
+|------------|-------------|---------|----------------|
+| Gen 2 | -4.65 | 0.221 | Lower than Gen 1 (not significant) |
+| Gen 3 | +0.20 | 0.955 | Similar to Gen 1 |
+| Gen 4 | +7.30 | 0.050 | Marginally higher |
+| Gen 5 | +8.12 | 0.016* | Significantly higher |
+| Gen 6 | -0.41 | 0.922 | Similar to Gen 1 |
+| Gen 7 | +11.9 | 0.003** | Highest increase |
+| Gen 8 | +9.97 | 0.010** | Significantly higher |
+| Gen 9 | +9.51 | 0.008** | Significantly higher |
+
+Generations 5, 7, 8, and 9 show statistically significant increases in Attack compared to Generation 1, suggesting evidence of power creep in raw comparisons.
+
+[4.1-generation-coefficients-simple]
+
+Full model analysis
+
+When we add control variables (HP, Defense, Sp.Attack, Sp.Defense, Speed, rarity, capture_rate, type, and other characteristics), the picture changes somewhat. The full model includes 38 predictors to account for confounding factors.
+
+After controlling for other combat stats and Pokémon characteristics:
+- Gen 5 (+5.40, p = 0.032) and Gen 7 (+7.38, p = 0.013) remain significant
+- Gen 8 and Gen 9 lose significance (p > 0.05)
+- Gen 2 shows a negative but non-significant coefficient
+
+This suggests that part of the apparent "power creep" in the simple model is explained by compositional changes across generations—for example, differences in type distribution, rarity composition, or baseline stat allocations.
+
+[4.3-full-model-coefficients]
+
+The strongest predictors of Attack in the full model are:
+1. Defense (β = 0.46, p < 0.001) — Pokémon with high Defense tend to have high Attack
+2. HP (β = 0.39, p < 0.001) — Positive relationship
+3. Speed (β = 0.33, p < 0.001) — Faster Pokémon have higher Attack
+4. Sp.Defense (β = 0.22, p < 0.001) — Positive relationship
+5. Rarity — Legendary (+14.4) and Mythical (+14.1) significantly higher
+
+Notably, Sp.Attack shows near-zero effect (β = 0.02, p = 0.45), reflecting the physical/special specialization in Pokémon design.
+
+LASSO Regularization: Feature Selection
+
+With 38 predictors in our full model, a natural question arises: which predictors actually matter for explaining Attack, and which are redundant or weak? Standard regression cannot answer this — it simply assigns a coefficient to every variable. LASSO (Least Absolute Shrinkage and Selection Operator) solves this by adding a penalty that forces predictors to "compete" for inclusion.
+
+How LASSO Works:
+LASSO modifies the standard regression by adding a penalty term proportional to the sum of absolute coefficient values. This penalty has a crucial property: it shrinks weak coefficients all the way to exactly zero, effectively removing those predictors from the model. The strength of the penalty is controlled by a tuning parameter λ (lambda):
+- Low λ: Mild penalty → most predictors survive
+- High λ: Harsh penalty → only the strongest predictors survive
+
+We use 10-fold cross-validation to find the optimal λ that balances prediction accuracy with model simplicity:
+- Lambda.min (0.24): Minimizes prediction error
+- Lambda.1se (0.80): One standard error rule — slightly higher error but much simpler model
+
+The Key Question for Power Creep:
+Does generation survive when forced to compete with all other predictors? If generation coefficients shrink to zero, then combat stats, type, and rarity explain Attack better than generation does. If generation survives, it means generation provides unique predictive information that other variables cannot capture — direct evidence that something changed across generations (i.e., power creep).
+
+| Model | Features Selected | Generation Retained? |
+|-------|-------------------|---------------------|
+| Lambda.min | 53 / 81 (65%) | Yes (6 of 8 levels) |
+| Lambda.1SE | 41 / 81 (51%) | Yes (5 of 8 levels) |
+
+Critical Finding: Generation SURVIVES automatic feature selection. Even in the strict 1-SE model (which keeps only 41 of 81 features), 5 generation levels retain non-zero coefficients. This means generation provides predictive value that cannot be explained by other Pokémon characteristics — strong evidence that Attack genuinely differs across generations beyond what type, rarity, or stat trade-offs would predict.
+
+[4.6-lasso-coefficient-plot]
+[4.6-lasso-regularization-path]
+
+Hypothesis Testing: Monotonic Trend
+
+While ANOVA tests whether generations differ, it does not test whether Attack systematically *increases* across generations—the essence of "power creep." The Jonckheere-Terpstra test addresses this by testing for a monotonic increasing trend.
+
+H₀: Attack distribution is the same across all generations
+H₁: Attack shows a monotonic INCREASING trend (Gen 1 → Gen 9)
+
+Results:
+- JT Statistic: 253,582.5
+- p-value: 2.09 × 10⁻⁵
+
+**Conclusion: SIGNIFICANT MONOTONIC TREND DETECTED (p < 0.05)**
+
+This provides direct statistical evidence that Attack values systematically increase across generations—precisely what "power creep" predicts. The linear trend across generation means is approximately +1.4 Attack points per generation.
+
+[5.3-jonckheere-trend-plot]
+
+Secondary Analyses: Subgroup Trends
+
+Not all Pokémon may experience equal power creep. We examine whether the trend is uniform across types and rarity categories.
+
+TYPE-SPECIFIC TRENDS
+
+Using the Jonckheere-Terpstra test for each primary type (with n ≥ 30):
+
+| Types with Power Creep | Types without Power Creep |
+|------------------------|---------------------------|
+| 3 types (19%) | 13 types (81%) |
+
+Only 3 of 16 types show statistically significant monotonic increases. Power creep in Attack is therefore NOT uniform across types—certain types drive the overall trend while others remain stable.
+
+[7.1-type-trends-heatmap]
+
+RARITY-SPECIFIC TRENDS
+
+This analysis answers a critical question: Is power creep occurring in competitively relevant (Normal) Pokémon, or mainly in Legendaries?
+
+| Rarity | JT Statistic | p-value | Conclusion |
+|--------|--------------|---------|------------|
+| Normal | 208,772 | 0.00019 | Power Creep ✓ |
+| SubLegendary | 599 | 0.025 | Power Creep ✓ |
+| Legendary | 92 | 0.537 | No Creep |
+| Mythical | 80.5 | 0.540 | No Creep |
+
+**Critical Finding:** Power creep affects NORMAL Pokémon (p < 0.001), meaning it has real implications for competitive play. The trend in Normal Pokémon is approximately +1.4 Attack points per generation. SubLegendary Pokémon also show significant creep, while Legendary and Mythical categories do not—likely due to smaller sample sizes and higher baseline variance.
+
+[7.2-rarity-trends-plot]
+
+Effect Size Analysis
+
+Statistical significance does not imply practical importance. We calculate Cohen's d to assess effect magnitude:
+
+| Generation | Cohen's d | Magnitude |
+|------------|-----------|-----------|
+| Gen 2 | -0.17 | Negligible |
+| Gen 3 | 0.01 | Negligible |
+| Gen 4 | 0.26 | Small |
+| Gen 5 | 0.29 | Small |
+| Gen 6 | -0.02 | Negligible |
+| Gen 7 | **0.41** | Small |
+| Gen 8 | 0.35 | Small |
+| Gen 9 | 0.34 | Small |
+
+The maximum effect (Gen 7, d = 0.41) is "small" by Cohen's standards, translating to approximately 12 Attack points higher than Generation 1. While statistically detectable, power creep in Attack is modest in practical terms.
+
+[8-cohens-d-plot]
+
+Robustness Checks
+
+To ensure findings are not driven by outliers or distributional assumptions, we compare:
+
+1. **OLS vs Robust Regression (Huber):** Coefficients differ by less than 5%, indicating outliers do not drive results.
+2. **Gamma GLM:** Alternative distributional assumption yields consistent conclusions.
+3. **LASSO:** Generation survives automatic feature selection.
+
+[6.2-robustness-comparison-plot]
+
+Conclusions: Attack Power Creep
+
+1. **Power creep EXISTS and is statistically significant:** The Jonckheere-Terpstra test confirms a monotonic increasing trend in Attack across generations (p = 2.09 × 10⁻⁵).
+
+2. **LASSO confirms generation matters:** Generation effects survive automatic feature selection, retaining 5-6 levels even in sparse models. This means generation provides predictive value beyond other Pokémon characteristics.
+
+3. **The effect is modest but real:** Cohen's d values are in the "small" range (0.3-0.4), translating to roughly 8-12 Attack points difference between early and later generations.
+
+4. **Power creep is NOT uniform:**
+   - Only 3 of 16 types show significant Attack increases
+   - Normal Pokémon ARE affected (p < 0.001), with competitive implications
+   - Legendary and Mythical Pokémon show no significant trend
+
+5. **Gen 7 stands out:** Generation 7 shows the strongest power creep effect (d = 0.41, +12 Attack points vs Gen 1).
+
+6. **Controlling for confounds reduces but does not eliminate the effect:** In the full model, generations 5 and 7 retain significance, suggesting true generational differences beyond compositional changes.
+
+7. **Findings are robust:** Multiple analytical approaches (GLM, LASSO, robust regression, Jonckheere-Terpstra) converge on the same conclusion.
